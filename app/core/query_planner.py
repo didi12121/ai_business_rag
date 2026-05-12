@@ -43,6 +43,12 @@ PLANNER_PROMPT = """
 18. 时间范围必须转成明确 start/end 格式 yyyy-MM-dd HH:mm:ss。
 19. 不要把疑问词放进 filters。
 20. 返回严格 JSON，不要 Markdown，不要解释。
+21. 如果上下文中有类似问题，可以参考其业务对象、指标等。
+22. 用户追问"为什么？""那今天呢？"时，沿用上一轮的业务对象和指标，只改变时间范围或增加原因分析步骤。
+
+=== 对话上下文 ===
+
+{conversation_context}
 
 === 用户问题 ===
 {question}
@@ -123,7 +129,10 @@ def _extract_json(text: str) -> str:
     return m.group(0) if m else text
 
 
-async def generate_query_plan(question: str) -> dict:
+async def generate_query_plan(
+    question: str,
+    conversation_context: list[dict] | None = None,
+) -> dict:
     overview = _build_table_overview()
     business_rules = load_business_rules()
     rules_text = json.dumps(
@@ -132,10 +141,21 @@ async def generate_query_plan(question: str) -> dict:
     )
     current_date = datetime.now().strftime("%Y-%m-%d")
 
+    # Build context string
+    context_text = ""
+    if conversation_context:
+        turns = []
+        for t in conversation_context[-3:]:  # last 3 turns
+            turns.append(f"  问: {t.get('question', '')}\n  答: {t.get('summary', t.get('answer', ''))[:300]}")
+        if turns:
+            context_text = "最近对话上下文：\n" + "\n".join(turns)
+            context_text += "\n\n你可以参考上下文理解省略表达和追问。但涉及新时间范围必须重新查询数据库。"
+
     prompt = PLANNER_PROMPT.format(
         current_date=current_date,
         table_overview=overview,
         business_rules=rules_text,
+        conversation_context=context_text or "无上下文",
         question=question,
     )
 

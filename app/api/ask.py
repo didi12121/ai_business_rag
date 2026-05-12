@@ -310,9 +310,16 @@ async def ask(req: AskRequest):
     if config.get("agent.enabled", True):
         agent_attempted = True
         try:
+            from app.core.conversation_memory import get_context
             from app.core.data_agent import run_data_agent
-            result = await run_data_agent(question, req.sessionId, req.userId, show_sql)
+            session_id = req.sessionId or "default"
+            ctx = get_context(session_id, max_turns=5)
+            result = await run_data_agent(
+                question, session_id, req.userId, show_sql,
+                conversation_context=ctx,
+            )
             result["durationMs"] = _now() - t0
+            result["sessionId"] = session_id
             if result.get("success"):
                 _save_chat_log(
                     req.sessionId, req.userId, question,
@@ -407,3 +414,11 @@ async def ask(req: AskRequest):
 def config_refresh():
     config = refresh_ai_config_cache()
     return {"success": True, "message": "AI配置缓存已刷新", "config": config}
+
+
+@router.post("/memory/clear")
+def memory_clear(body: dict):
+    from app.core.conversation_memory import clear_context
+    sid = body.get("sessionId", "")
+    clear_context(sid)
+    return {"success": True, "message": "上下文已清空"}

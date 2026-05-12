@@ -27,6 +27,9 @@ SQL_BUILDER_PROMPT = """
 === 当前步骤 ===
 {step_json}
 
+=== 对话上下文 ===
+{conversation_context}
+
 === 之前步骤的结果摘要 ===
 {previous_summary}
 
@@ -108,13 +111,14 @@ async def build_step_sql(
     plan: dict,
     step: dict,
     previous_observations: list[dict],
+    conversation_context: list[dict] | None = None,
 ) -> dict:
     schema_text = _build_schema_text()
     rules = load_business_rules()
     rules_text = json.dumps([r.get("rule_content", "") for r in rules], ensure_ascii=False)
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Summarize previous observations (include first 5 rows for dependsOn)
+    # Summarize previous observations
     prev_summary = "无"
     if previous_observations:
         parts = []
@@ -126,10 +130,21 @@ async def build_step_sql(
                 parts.append(f"  前{len(rows_preview)}行数据: " + json.dumps(rows_preview, ensure_ascii=False, default=str))
         prev_summary = "\n".join(parts)
 
+    # Conversation context
+    ctx_text = "无"
+    if conversation_context:
+        ctx_parts = []
+        for t in conversation_context[-3:]:
+            ctx_parts.append(f"  用户问: {t.get('question', '')}")
+            ctx_parts.append(f"  回答摘要: {t.get('summary', t.get('answer', ''))[:200]}")
+        if ctx_parts:
+            ctx_text = "最近对话:\n" + "\n".join(ctx_parts)
+
     prompt = SQL_BUILDER_PROMPT.format(
         current_date=current_date,
         table_schemas=schema_text,
         business_rules=rules_text,
+        conversation_context=ctx_text,
         question=question,
         plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
         step_json=json.dumps(step, ensure_ascii=False, indent=2),

@@ -1,7 +1,9 @@
 import json
 import time
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import text
 
@@ -12,6 +14,14 @@ from app.core.query_planner import generate_query_plan
 from app.core.query_plan_validator import validate_and_fix_plan
 from app.core.agent_sql_builder import build_step_sql
 from app.core.agent_answer import generate_final_answer
+from app.core.conversation_memory import add_turn
+
+EventCallback = Callable[[dict[str, Any]], Awaitable[None]] | None
+
+
+async def _emit(cb: EventCallback, event: str, **kwargs):
+    if cb:
+        await cb({"event": event, **kwargs})
 
 
 def _normalize_value(value):
@@ -85,8 +95,11 @@ async def run_data_agent(
     session_id: str | None = None,
     user_id: str | None = None,
     show_sql: bool | None = None,
+    event_callback: EventCallback = None,
+    conversation_context: list[dict] | None = None,
 ) -> dict:
     t0 = time.time()
+    cb = event_callback
     config = get_ai_config()
     max_steps = config.get("agent.max_steps", 5)
     default_limit = config.get("agent.default_limit", 100)
@@ -97,6 +110,7 @@ async def run_data_agent(
 
     # Reject modifications
     if is_modification_request(question):
+        await _emit(cb, "error", errorCode="REJECTED", errorMsg="修改类请求")
         return {
             "success": False, "queryMode": "agent",
             "question": question,
@@ -105,8 +119,13 @@ async def run_data_agent(
             "durationMs": int((time.time() - t0) * 1000),
         }
 
-    # Generate query plan
-    plan = await generate_query_plan(question)
+    # Planning
+    await _emit(cb, "thinking", step="agent", text="AI Agent 正在理解问题...")
+    await _emit(cb, "planning_start", text="正在分析问题并生成查询计划...")
+
+    plan = await generate_query_plan(question, conversation_context)
+    await _emit(cb, "plan_ready", plan=plan)
+
     if not plan.get("canAnswer"):
         return {
             "success": False, "queryMode": "agent",
@@ -140,9 +159,10 @@ async def run_data_agent(
         step_t0 = time.time()
         sid = step.get("stepId", len(observations) + 1)
 
-        # Check dependency
+        # Dependency check
         ok, reason = _dependency_satisfied(step, observations)
         if not ok:
+            await _emit(cb, "step_skipped", stepId=sid, reason=reason, errorCode="SKIPPED_DEPENDENCY")
             step_logs.append(dict(
                 stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                 success=False, errorCode="SKIPPED_DEPENDENCY", errorMsg=reason,
@@ -154,13 +174,22 @@ async def run_data_agent(
                 break
             continue
 
-        # Build SQL — pass rowsPreview from previous observations
-        sql_result = await build_step_sql(question, plan, step, observations)
+        # Step start
+        await _emit(cb, "step_start", stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""))
 
+        # Build SQL
+        sql_result = await build_step_sql(question, plan, step, observations, conversation_context)
         step_sql = sql_result.get("sql")
         bind_params = sql_result.get("params") or {}
 
+        await _emit(cb, "sql_generated", stepId=sid,
+                    sql=step_sql, usedTables=sql_result.get("usedTables", []),
+                    reason=sql_result.get("reason", ""),
+                    riskLevel=sql_result.get("riskLevel", "low"))
+
         if not sql_result.get("canGenerate") or not step_sql:
+            await _emit(cb, "step_error", stepId=sid, errorCode="SQL_BUILDER_FAILED",
+                        errorMsg=sql_result.get("reason", ""))
             step_logs.append(dict(
                 stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                 success=False, errorCode="SQL_BUILDER_FAILED",
@@ -175,7 +204,9 @@ async def run_data_agent(
         # Safety check
         try:
             step_sql = check_sql_safety(step_sql, max_rows=max_rows, is_free_sql=True)
+            await _emit(cb, "sql_checked", stepId=sid, success=True, text="SQL 安全检查通过")
         except Exception as e:
+            await _emit(cb, "step_error", stepId=sid, errorCode="SQL_SAFETY_ERROR", errorMsg=str(e))
             step_logs.append(dict(
                 stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                 success=False, errorCode="SQL_SAFETY_ERROR", errorMsg=str(e),
@@ -193,16 +224,17 @@ async def run_data_agent(
         if explain_before:
             db = SessionLocal()
             try:
-                explain_sql = f"EXPLAIN {step_sql}"
-                explain_result = db.execute(text(explain_sql), bind_params).fetchall()
+                explain_sql_text = f"EXPLAIN {step_sql}"
+                explain_result = db.execute(text(explain_sql_text), bind_params).fetchall()
                 total = 0
                 for r in explain_result:
-                    try:
-                        total += int(r._mapping.get("rows", 0) or 0)
-                    except (ValueError, TypeError):
-                        pass
+                    try: total += int(r._mapping.get("rows", 0) or 0)
+                    except (ValueError, TypeError): pass
                 estimated_rows = total
+                await _emit(cb, "explain_done", stepId=sid, estimatedRows=estimated_rows, success=True)
                 if estimated_rows > max_est_rows:
+                    await _emit(cb, "step_error", stepId=sid, errorCode="SQL_TOO_LARGE",
+                                errorMsg=f"预估扫描 {estimated_rows} 行 > {max_est_rows}")
                     step_logs.append(dict(
                         stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                         success=False, errorCode="SQL_TOO_LARGE",
@@ -216,6 +248,7 @@ async def run_data_agent(
                     db.close()
                     continue
             except Exception as e:
+                await _emit(cb, "step_error", stepId=sid, errorCode="SQL_EXPLAIN_ERROR", errorMsg=str(e))
                 step_logs.append(dict(
                     stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                     success=False, errorCode="SQL_EXPLAIN_ERROR", errorMsg=str(e),
@@ -240,6 +273,7 @@ async def run_data_agent(
             columns = list(result.keys())
             rows = [dict(zip(columns, r)) for r in rows_raw]
         except Exception as e:
+            await _emit(cb, "step_error", stepId=sid, errorCode="SQL_EXECUTE_ERROR", errorMsg=str(e))
             step_logs.append(dict(
                 stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
                 success=False, errorCode="SQL_EXECUTE_ERROR", errorMsg=str(e),
@@ -272,6 +306,11 @@ async def run_data_agent(
         }
         observations.append(observation)
 
+        await _emit(cb, "step_done", stepId=sid, name=step.get("name", ""),
+                    purpose=step.get("purpose", ""),
+                    rowCount=len(rows), rowsPreview=normalized_rows[:3],
+                    success=True, durationMs=step_duration)
+
         step_logs.append(dict(
             stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
             success=True, errorCode=None, errorMsg=None,
@@ -282,7 +321,7 @@ async def run_data_agent(
             durationMs=step_duration,
         ))
 
-    # Compute success state
+    # Success state
     successful_steps = [s for s in step_logs if s.get("success")]
     failed_steps = [s for s in step_logs if not s.get("success")]
     all_ok = len(successful_steps) > 0 and len(failed_steps) == 0
@@ -302,8 +341,10 @@ async def run_data_agent(
         error_code = None if all_ok else "AGENT_ERROR"
         error_msg = "" if all_ok else "部分步骤失败"
 
-    # Generate final answer
+    # Final answer
+    answer = ""
     if observations:
+        await _emit(cb, "answer_start", text="正在根据查询结果生成回答...")
         try:
             answer = await generate_final_answer(
                 question, plan, observations,
@@ -325,7 +366,7 @@ async def run_data_agent(
     )
     _save_step_logs(run_id, step_logs)
 
-    return {
+    result = {
         "success": success,
         "partialSuccess": partial_success,
         "queryMode": "agent",
@@ -336,3 +377,18 @@ async def run_data_agent(
         "steps": step_logs,
         "durationMs": duration_ms,
     }
+
+    # Save to conversation memory
+    try:
+        add_turn(session_id or "default", {
+            "question": question,
+            "answer": answer,
+            "queryMode": "agent",
+            "plan": plan,
+            "observations": observations,
+        })
+    except Exception:
+        pass
+
+    await _emit(cb, "done", **result)
+    return result

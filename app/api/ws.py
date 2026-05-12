@@ -60,6 +60,12 @@ async def ws_chat(ws: WebSocket):
     show_sql = body.get("showSql", config.get("sql.show_sql_default", True))
 
     try:
+        session_id = body.get("sessionId")
+        if not session_id:
+            from app.core.conversation_memory import new_session_id
+            session_id = new_session_id()
+            await _send(ws, "session", {"sessionId": session_id})
+
         # Reject modification requests
         if is_modification_request(question):
             await _send(ws, "error", {"message": "当前 AI 模块只支持查询和分析，不支持修改业务数据。"})
@@ -68,40 +74,26 @@ async def ws_chat(ws: WebSocket):
 
         # Agent mode (priority)
         if config.get("agent.enabled", True):
+            from app.core.conversation_memory import get_context
             from app.core.data_agent import run_data_agent
 
-            await _send(ws, "thinking", {"step": "agent", "text": "AI Agent 正在规划查询..."})
+            ctx = get_context(session_id, max_turns=5)
 
-            result = await run_data_agent(question, None, None, show_sql)
+            async def event_cb(payload: dict):
+                try:
+                    await _send(ws, payload["event"], payload)
+                except Exception:
+                    pass
 
-            if result.get("plan"):
-                await _send(ws, "plan_ready", {
-                    "plan": result["plan"],
-                    "taskType": result["plan"].get("taskType", ""),
-                    "goal": result["plan"].get("goal", ""),
-                })
-
-            # Send each step observation
-            for obs in result.get("observations", []):
-                await _send(ws, "step_done", obs)
-
-            # Stream final answer
-            answer = result.get("answer", "")
-            if answer:
-                await _send(ws, "answer_start")
-                # Simulate streaming for agent answer (split into chunks)
-                chunk_size = 10
-                for i in range(0, len(answer), chunk_size):
-                    await _send(ws, "answer_chunk", {"text": answer[i:i + chunk_size]})
-
-            duration_ms = int((time.time() - t0) * 1000)
-            await _send(ws, "done", {
-                "durationMs": duration_ms,
-                "queryMode": "agent",
-                "plan": result.get("plan"),
-                "observations": result.get("observations", []),
-                "steps": result.get("steps", []),
-            })
+            await run_data_agent(
+                question=question,
+                session_id=session_id,
+                user_id=None,
+                show_sql=show_sql,
+                event_callback=event_cb,
+                conversation_context=ctx,
+            )
+            # run_data_agent already emitted done/error — close normally
             await ws.close()
             return
 
