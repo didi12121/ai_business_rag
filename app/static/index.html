@@ -286,9 +286,15 @@ function addExtraButtons(meta) {
 }
 
 function finishAiMsg(answer, meta) {
+  // Free SQL warning
+  if (meta.queryMode === 'free_sql') {
+    const warn = document.createElement('div');
+    warn.style.cssText = 'font-size:11px;color:#92400e;background:#fef3c7;padding:6px 10px;border-radius:6px;margin-top:6px;';
+    warn.textContent = '⚠ 该 SQL 由 AI 根据表结构自动生成，已通过只读和安全检查。风险等级: ' + (meta.riskLevel || '-');
+    currentAiMsg.col.appendChild(warn);
+  }
   setAiBubble(escapeHtml(answer).replace(/\n/g, '<br>'));
   addExtraButtons(meta || {});
-  // Mark all running steps as done
   if (currentSteps) {
     currentSteps.querySelectorAll('.think-step.running').forEach(el => {
       el.className = 'think-step done';
@@ -337,13 +343,30 @@ async function ask(question) {
 
     switch (data.event) {
       case 'thinking':
-        if (data.step === 'intent') {
+        if (data.step === 'agent') {
+          addStep('agent', '🧠', data.text, 'running');
+        } else if (data.step === 'intent') {
           addStep('intent', '⏳', data.text, 'running');
+        } else if (data.step === 'free_sql') {
+          addStep('free_sql', '🤖', data.text, 'running');
         } else if (data.step === 'safety') {
           addStep('safety', '⏳', data.text, 'running');
+        } else if (data.step === 'explain') {
+          addStep('explain', '⏳', data.text, 'running');
         } else if (data.step === 'query') {
           addStep('query', '⏳', data.text, 'running');
         }
+        break;
+
+      case 'plan_ready':
+        addStep('agent', '✅', '规划完成: ' + (data.goal || data.taskType || ''), 'done');
+        meta.plan = data.plan;
+        break;
+
+      case 'step_done':
+        addStep('step' + data.stepId, '✅',
+          'Step ' + data.stepId + ': ' + (data.name || data.purpose || '') +
+          ' (' + data.rowCount + '行, ' + (data.durationMs || 0) + 'ms)', 'done');
         break;
 
       case 'intent_done':
@@ -368,11 +391,21 @@ async function ask(question) {
         addStep('safety', '⏳', '正在安全检查...', 'running');
         break;
 
+      case 'free_sql_reason':
+        addStep('free_sql', '✅', 'AI 生成 SQL: ' + (data.reason || '').slice(0, 80), 'done');
+        if (data.riskLevel) meta.riskLevel = data.riskLevel;
+        if (data.usedTables) meta.usedTables = data.usedTables;
+        break;
+
       case 'query_done':
         addStep('safety', '✅', '安全检查通过', 'done');
+        if (document.querySelector('[data-step="explain"]')) {
+          addStep('explain', '✅', '预估行数: ' + (data.estimatedRows || 'N/A'), 'done');
+        }
         addStep('query', '✅', '查询完成: ' + data.rowCount + ' 行', 'done');
         meta.rows = data.rows;
         meta.rowCount = data.rowCount;
+        meta.estimatedRows = data.estimatedRows;
         break;
 
       case 'answer_start':
@@ -389,6 +422,11 @@ async function ask(question) {
 
       case 'done':
         meta.durationMs = data.durationMs;
+        meta.queryMode = data.queryMode;
+        if (data.freeSqlReason) meta.freeSqlReason = data.freeSqlReason;
+        if (data.riskLevel) meta.riskLevel = data.riskLevel;
+        if (data.usedTables) meta.usedTables = data.usedTables;
+        if (data.estimatedRows) meta.estimatedRows = data.estimatedRows;
         finishAiMsg(answerText, meta);
         sendBtn.disabled = false;
         socket.close();

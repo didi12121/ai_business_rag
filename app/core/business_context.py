@@ -10,7 +10,8 @@ def load_table_schemas():
             dict(row._mapping)
             for row in db.execute(
                 text(
-                    "SELECT table_name, business_name, description, example_question "
+                    "SELECT table_name, business_name, description, example_question, "
+                    "COALESCE(allow_query, 0) AS allow_query "
                     "FROM ai_table_schema WHERE enabled = 1"
                 )
             ).fetchall()

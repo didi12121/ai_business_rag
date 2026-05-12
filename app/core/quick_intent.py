@@ -25,15 +25,17 @@ def quick_intent_match(question: str) -> dict | None:
 
     # factory_product_list: "xxx有哪些产品？" / "xxx的产品"
     m = re.search(r"(.+?)(有哪些?|做什么?|生产什么?|的).*产品", q)
-    if m and len(m.group(1)) < 20:
+    if m and m.group(1) and len(m.group(1)) < 20:
         name = m.group(1).strip().rstrip("的")
-        return {"intent": "factory_product_list", "confidence": 0.92, "params": {"factoryName": name}, "reason": "本地规则匹配"}
+        if not _is_bad_param(name):
+            return {"intent": "factory_product_list", "confidence": 0.92, "params": {"factoryName": name}, "reason": "本地规则匹配"}
 
     # product_parts_query: "xxx有什么胶件/配件"
     m = re.search(r"(.+?)(有什么?|有哪些?|什么).*(胶件|配件|零件|部件)", q)
-    if m and len(m.group(1)) < 30:
+    if m and m.group(1) and len(m.group(1)) < 30:
         name = m.group(1).strip()
-        return {"intent": "product_parts_query", "confidence": 0.92, "params": {"productName": name}, "reason": "本地规则匹配"}
+        if not _is_bad_param(name):
+            return {"intent": "product_parts_query", "confidence": 0.92, "params": {"productName": name}, "reason": "本地规则匹配"}
 
     # product_info_query: "xxx单价/多少钱/信息/是什么/什么颜色/什么原料"
     m = re.search(r"(.+?)(单价|多少钱|什么价|信息|详情|规格|是什么|什么颜色|什么原料|重量|多重)", q)
@@ -67,24 +69,25 @@ def quick_intent_match(question: str) -> dict | None:
     if any(w in q for w in ["订单明细", "订单里有什么", "订单包含"]):
         return {"intent": "order_detail", "confidence": 0.92, "params": {}, "reason": "本地规则匹配"}
 
-    # product_out_summary: "出货流水" (NOT "出库单"/"订单"!)
+    # product_out_summary: "出货流水" — only if asking about a specific product
     has_time = any(w in q for w in ["这个月", "本月", "上个月", "上月", "今天"])
-    has_out = any(w in q for w in ["出了多少", "出货", "出库", "出了几", "出了好多"])
-    if has_time and has_out:
+    has_out = any(w in q for w in ["出了多少", "出货流水", "出库流水", "出了几", "出了好多"])
+    has_specific = any(w in q for w in ["出了多少", "出了几", "出了好多"])
+    if has_time and has_out and "订单" not in q and "出库单" not in q:
         params = _fill_dates({}, question)
-        # extract product name
-        m = re.search(r"这个月|本月|上个月|上月|今天(.+?)(出了多少|出货|出库)", q)
-        if not m:
-            m = re.search(r"(.+?)(出了多少|出货|出库)", q)
-        if m and len(m.group(1)) < 30:
+        m = re.search(r"(.+?)(出了多少|出了几|出了好多|出货流水|出库流水)", q)
+        if m and m.group(1) and len(m.group(1)) < 30 and not _is_bad_param(m.group(1)):
             params["productName"] = m.group(1).strip()
+        # Only match if asking about specific product quantity ("出了多少"), not rankings
+        if not has_specific and not params.get("productName"):
+            return None  # let LLM handle "哪个产品出货最多" type questions
         return {"intent": "product_out_summary", "confidence": 0.90, "params": params, "reason": "本地规则匹配"}
 
     # raw_material_usage: "这个月xxx用了多少" / "原料消耗"
-    has_usage = any(w in q for w in ["用了多少", "原料消耗", "原料用了", "消耗排行", "用了多少原料"])
-    if has_time or has_usage:
+    has_usage = any(w in q for w in ["用了多少", "原料消耗", "消耗排行", "用了多少原料"])
+    if (has_time or has_usage) and "订单" not in q:
         m = re.search(r"(.+?)(用了多少|消耗|原料)", q)
-        if m and len(m.group(1)) < 20:
+        if m and m.group(1) and len(m.group(1)) < 20 and not _is_bad_param(m.group(1)):
             params = _fill_dates({}, question)
             params["rawName"] = m.group(1).strip()
             return {"intent": "raw_material_usage", "confidence": 0.90, "params": params, "reason": "本地规则匹配"}
@@ -108,6 +111,16 @@ def quick_intent_match(question: str) -> dict | None:
         return {"intent": "monthly_inventory_query", "confidence": 0.90, "params": params, "reason": "本地规则匹配"}
 
     return None
+
+
+INTERROGATIVE = {"哪个", "什么", "多少", "哪些", "最高", "最低", "最多", "最少", "排行", "排名", "怎样", "怎么", "如何", "哪家", "哪一", "谁"}
+
+
+def _is_bad_param(val) -> bool:
+    """Check if extracted param is actually an interrogative phrase rather than a real value."""
+    if not val:
+        return False
+    return any(w in val for w in INTERROGATIVE)
 
 
 def _fill_dates(params: dict, question: str) -> dict:
