@@ -114,14 +114,17 @@ async def build_step_sql(
     rules_text = json.dumps([r.get("rule_content", "") for r in rules], ensure_ascii=False)
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Summarize previous observations
+    # Summarize previous observations (include first 5 rows for dependsOn)
     prev_summary = "无"
     if previous_observations:
-        summaries = []
+        parts = []
         for obs in previous_observations:
             row_count = obs.get("rowCount", 0)
-            summaries.append(f"  Step {obs.get('stepId', '?')}: {row_count} 行, 目的: {obs.get('purpose', '')}")
-        prev_summary = "\n".join(summaries)
+            parts.append(f"Step {obs.get('stepId', '?')}: {row_count} 行, 目的: {obs.get('purpose', '')}")
+            rows_preview = obs.get("rows", [])[:5]
+            if rows_preview:
+                parts.append(f"  前{len(rows_preview)}行数据: " + json.dumps(rows_preview, ensure_ascii=False, default=str))
+        prev_summary = "\n".join(parts)
 
     prompt = SQL_BUILDER_PROMPT.format(
         current_date=current_date,

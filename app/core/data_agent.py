@@ -6,7 +6,6 @@ from decimal import Decimal
 from sqlalchemy import text
 
 from app.database import SessionLocal
-from app.llm.openai_compatible import create_llm_client
 from app.core.sys_config import get_ai_config
 from app.core.sql_safety import check_sql_safety, build_display_sql, is_modification_request
 from app.core.query_planner import generate_query_plan
@@ -49,28 +48,31 @@ def _save_agent_run(session_id, user_id, question, plan, answer,
         db.close()
 
 
-def _save_step_log(run_id, step_id, step_name, purpose, sql_text,
-                   used_tables, row_count, rows_preview, estimated_rows,
-                   success, error_code, error_msg, duration_ms):
+def _save_step_logs(run_id, step_logs):
+    if not run_id:
+        return
     db = SessionLocal()
     try:
-        db.execute(text(
-            "INSERT INTO ai_agent_step_log "
-            "(run_id, step_id, step_name, purpose, sql_text, used_tables, "
-            "row_count, rows_preview, estimated_rows, success, "
-            "error_code, error_msg, duration_ms, create_time) VALUES "
-            "(:r, :si, :sn, :p, :st, :ut, :rc, :rp, :er, :ok, "
-            ":ec, :em, :d, NOW())"
-        ), {
-            "r": run_id, "si": step_id, "sn": step_name, "p": purpose,
-            "st": sql_text,
-            "ut": json.dumps(used_tables) if used_tables else None,
-            "rc": row_count,
-            "rp": json.dumps(rows_preview, ensure_ascii=False, default=str) if rows_preview else None,
-            "er": estimated_rows,
-            "ok": 1 if success else 0, "ec": error_code, "em": error_msg,
-            "d": duration_ms,
-        })
+        for log in step_logs:
+            db.execute(text(
+                "INSERT INTO ai_agent_step_log "
+                "(run_id, step_id, step_name, purpose, sql_text, used_tables, "
+                "row_count, rows_preview, estimated_rows, success, "
+                "error_code, error_msg, duration_ms, create_time) VALUES "
+                "(:r, :si, :sn, :p, :st, :ut, :rc, :rp, :er, :ok, "
+                ":ec, :em, :d, NOW())"
+            ), {
+                "r": run_id, "si": log.get("stepId"),
+                "sn": log.get("name", ""), "p": log.get("purpose", ""),
+                "st": log.get("sql"),
+                "ut": json.dumps(log.get("usedTables", [])) if log.get("usedTables") else None,
+                "rc": log.get("rowCount", 0),
+                "rp": json.dumps(log.get("rowsPreview", []), ensure_ascii=False, default=str) if log.get("rowsPreview") else None,
+                "er": log.get("estimatedRows"),
+                "ok": 1 if log.get("success", False) else 0,
+                "ec": log.get("errorCode"), "em": log.get("errorMsg"),
+                "d": log.get("durationMs", 0),
+            })
         db.commit()
     except Exception:
         db.rollback()
@@ -89,27 +91,29 @@ async def run_data_agent(
     max_steps = config.get("agent.max_steps", 5)
     default_limit = config.get("agent.default_limit", 100)
     max_rows = config.get("free_sql.max_rows", 200)
+    explain_before = config.get("free_sql.explain_before_run", True)
+    max_est_rows = config.get("free_sql.max_estimated_rows", 50000)
+    timeout_sec = config.get("sql.timeout_seconds", 10)
 
     # Reject modifications
     if is_modification_request(question):
-        duration_ms = int((time.time() - t0) * 1000)
         return {
             "success": False, "queryMode": "agent",
-            "question": question, "answer": "当前 AI 模块只支持查询和分析，不支持修改业务数据。",
-            "errorCode": "REJECTED", "errorMsg": "修改类请求", "durationMs": duration_ms,
+            "question": question,
+            "answer": "当前 AI 模块只支持查询和分析，不支持修改业务数据。",
+            "errorCode": "REJECTED", "errorMsg": "修改类请求",
+            "durationMs": int((time.time() - t0) * 1000),
         }
 
     # Generate query plan
     plan = await generate_query_plan(question)
-
     if not plan.get("canAnswer"):
-        duration_ms = int((time.time() - t0) * 1000)
         return {
             "success": False, "queryMode": "agent",
             "question": question, "plan": plan,
             "answer": f"无法回答：{plan.get('reason', '未知原因')}",
             "errorCode": "QUERY_PLAN_FAILED", "errorMsg": plan.get("reason", ""),
-            "durationMs": duration_ms,
+            "durationMs": int((time.time() - t0) * 1000),
         }
 
     # Validate plan
@@ -118,61 +122,52 @@ async def run_data_agent(
 
     observations = []
     step_logs = []
-    all_sqls = []
 
     for step in steps[:max_steps]:
         step_t0 = time.time()
         sid = step.get("stepId", len(observations) + 1)
 
-        # Build SQL
+        # Build SQL — pass rowsPreview from previous observations
         sql_result = await build_step_sql(question, plan, step, observations)
 
-        if not sql_result.get("canGenerate") or not sql_result.get("sql"):
-            step_logs.append({
-                "stepId": sid, "name": step.get("name", ""),
-                "purpose": step.get("purpose", ""),
-                "success": False, "errorCode": "SQL_BUILDER_FAILED",
-                "errorMsg": sql_result.get("reason", ""),
-                "sql": None, "rowCount": 0, "rowsPreview": [],
-                "usedTables": sql_result.get("usedTables", []),
-                "riskLevel": sql_result.get("riskLevel", "high"),
-                "durationMs": int((time.time() - step_t0) * 1000),
-            })
-            _save_step_log(
-                None, sid, step.get("name", ""), step.get("purpose", ""),
-                None, sql_result.get("usedTables", []), 0, None, None,
-                False, "SQL_BUILDER_FAILED", sql_result.get("reason", ""),
-                int((time.time() - step_t0) * 1000),
-            )
-            continue
+        step_sql = sql_result.get("sql")
+        bind_params = sql_result.get("params") or {}
 
-        step_sql = sql_result["sql"]
+        if not sql_result.get("canGenerate") or not step_sql:
+            step_logs.append(dict(
+                stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                success=False, errorCode="SQL_BUILDER_FAILED",
+                errorMsg=sql_result.get("reason", ""),
+                sql=None, rowCount=0, rowsPreview=[],
+                usedTables=sql_result.get("usedTables", []),
+                riskLevel=sql_result.get("riskLevel", "high"),
+                durationMs=int((time.time() - step_t0) * 1000),
+            ))
+            continue
 
         # Safety check
         try:
             step_sql = check_sql_safety(step_sql, max_rows=max_rows, is_free_sql=True)
         except Exception as e:
-            step_logs.append({
-                "stepId": sid, "name": step.get("name", ""),
-                "purpose": step.get("purpose", ""),
-                "success": False, "errorCode": "SQL_SAFETY_ERROR",
-                "errorMsg": str(e), "sql": step_sql,
-                "rowCount": 0, "rowsPreview": [],
-                "usedTables": sql_result.get("usedTables", []),
-                "riskLevel": sql_result.get("riskLevel", "high"),
-                "durationMs": int((time.time() - step_t0) * 1000),
-            })
+            step_logs.append(dict(
+                stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                success=False, errorCode="SQL_SAFETY_ERROR", errorMsg=str(e),
+                sql=step_sql, rowCount=0, rowsPreview=[],
+                usedTables=sql_result.get("usedTables", []),
+                riskLevel=sql_result.get("riskLevel", "high"),
+                durationMs=int((time.time() - step_t0) * 1000),
+            ))
             continue
 
-        display_sql = build_display_sql(step_sql, sql_result.get("params", {}))
-        all_sqls.append(display_sql)
+        display_sql = build_display_sql(step_sql, bind_params)
 
         # EXPLAIN
         estimated_rows = None
-        if config.get("free_sql.explain_before_run", True):
+        if explain_before:
             db = SessionLocal()
             try:
-                explain_result = db.execute(text(f"EXPLAIN {step_sql}")).fetchall()
+                explain_sql = f"EXPLAIN {step_sql}"
+                explain_result = db.execute(text(explain_sql), bind_params).fetchall()
                 total = 0
                 for r in explain_result:
                     try:
@@ -180,33 +175,28 @@ async def run_data_agent(
                     except (ValueError, TypeError):
                         pass
                 estimated_rows = total
-                max_est = config.get("free_sql.max_estimated_rows", 50000)
-                if estimated_rows > max_est:
-                    step_logs.append({
-                        "stepId": sid, "name": step.get("name", ""),
-                        "purpose": step.get("purpose", ""),
-                        "success": False, "errorCode": "SQL_TOO_LARGE",
-                        "errorMsg": f"预估扫描 {estimated_rows} 行 > {max_est}",
-                        "sql": display_sql,
-                        "estimatedRows": estimated_rows,
-                        "rowCount": 0, "rowsPreview": [],
-                        "usedTables": sql_result.get("usedTables", []),
-                        "riskLevel": sql_result.get("riskLevel", "high"),
-                        "durationMs": int((time.time() - step_t0) * 1000),
-                    })
+                if estimated_rows > max_est_rows:
+                    step_logs.append(dict(
+                        stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                        success=False, errorCode="SQL_TOO_LARGE",
+                        errorMsg=f"预估扫描 {estimated_rows} 行 > {max_est_rows}",
+                        sql=display_sql, estimatedRows=estimated_rows,
+                        rowCount=0, rowsPreview=[],
+                        usedTables=sql_result.get("usedTables", []),
+                        riskLevel=sql_result.get("riskLevel", "high"),
+                        durationMs=int((time.time() - step_t0) * 1000),
+                    ))
                     db.close()
                     continue
             except Exception as e:
-                step_logs.append({
-                    "stepId": sid, "name": step.get("name", ""),
-                    "purpose": step.get("purpose", ""),
-                    "success": False, "errorCode": "SQL_EXPLAIN_ERROR",
-                    "errorMsg": str(e), "sql": display_sql,
-                    "rowCount": 0, "rowsPreview": [],
-                    "usedTables": sql_result.get("usedTables", []),
-                    "riskLevel": sql_result.get("riskLevel", "high"),
-                    "durationMs": int((time.time() - step_t0) * 1000),
-                })
+                step_logs.append(dict(
+                    stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                    success=False, errorCode="SQL_EXPLAIN_ERROR", errorMsg=str(e),
+                    sql=display_sql, rowCount=0, rowsPreview=[],
+                    usedTables=sql_result.get("usedTables", []),
+                    riskLevel=sql_result.get("riskLevel", "high"),
+                    durationMs=int((time.time() - step_t0) * 1000),
+                ))
                 db.close()
                 continue
             finally:
@@ -217,23 +207,21 @@ async def run_data_agent(
         db = SessionLocal()
         try:
             db.execute(text("SET SESSION max_execution_time = :t"),
-                       {"t": config.get("sql.timeout_seconds", 10) * 1000})
-            result = db.execute(text(step_sql))
+                       {"t": timeout_sec * 1000})
+            result = db.execute(text(step_sql), bind_params)
             rows_raw = result.fetchall()
             columns = list(result.keys())
             rows = [dict(zip(columns, r)) for r in rows_raw]
         except Exception as e:
-            step_logs.append({
-                "stepId": sid, "name": step.get("name", ""),
-                "purpose": step.get("purpose", ""),
-                "success": False, "errorCode": "SQL_EXECUTE_ERROR",
-                "errorMsg": str(e), "sql": display_sql,
-                "estimatedRows": estimated_rows,
-                "rowCount": 0, "rowsPreview": [],
-                "usedTables": sql_result.get("usedTables", []),
-                "riskLevel": sql_result.get("riskLevel", "high"),
-                "durationMs": int((time.time() - step_t0) * 1000),
-            })
+            step_logs.append(dict(
+                stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                success=False, errorCode="SQL_EXECUTE_ERROR", errorMsg=str(e),
+                sql=display_sql, estimatedRows=estimated_rows,
+                rowCount=0, rowsPreview=[],
+                usedTables=sql_result.get("usedTables", []),
+                riskLevel=sql_result.get("riskLevel", "high"),
+                durationMs=int((time.time() - step_t0) * 1000),
+            ))
             db.close()
             continue
         finally:
@@ -256,48 +244,37 @@ async def run_data_agent(
         }
         observations.append(observation)
 
-        step_logs.append({
-            "stepId": sid, "name": step.get("name", ""),
-            "purpose": step.get("purpose", ""),
-            "success": True, "errorCode": None, "errorMsg": None,
-            "sql": display_sql,
-            "estimatedRows": estimated_rows,
-            "rowCount": len(rows), "rowsPreview": normalized_rows[:20],
-            "usedTables": sql_result.get("usedTables", []),
-            "riskLevel": sql_result.get("riskLevel", "low"),
-            "durationMs": step_duration,
-        })
+        step_logs.append(dict(
+            stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+            success=True, errorCode=None, errorMsg=None,
+            sql=display_sql, estimatedRows=estimated_rows,
+            rowCount=len(rows), rowsPreview=normalized_rows[:20],
+            usedTables=sql_result.get("usedTables", []),
+            riskLevel=sql_result.get("riskLevel", "low"),
+            durationMs=step_duration,
+        ))
 
     # Generate final answer
+    success = False
     if observations:
         try:
             answer = await generate_final_answer(question, plan, observations)
+            success = any(s.get("success") for s in step_logs)
         except Exception as e:
             answer = f"回答生成失败：{e}"
-            success = False
     else:
         answer = "未能获取任何有效数据来回答该问题。"
-        success = False
 
-    success = all(s.get("success", False) for s in step_logs) if step_logs else False
     duration_ms = int((time.time() - t0) * 1000)
 
-    # Save logs
+    # Save logs (after we know success status)
+    error_code = None if success else "AGENT_ERROR"
+    error_msg = "" if success else "部分或全部步骤失败"
     run_id = _save_agent_run(
         session_id, user_id, question, plan, answer,
-        success, None if success else "AGENT_ERROR", "" if success else "部分步骤失败",
-        duration_ms,
+        success, error_code, error_msg, duration_ms,
     )
-    if run_id:
-        for log in step_logs:
-            _save_step_log(
-                run_id, log["stepId"], log["name"], log["purpose"],
-                log.get("sql"), log.get("usedTables", []),
-                log.get("rowCount", 0), log.get("rowsPreview", []),
-                log.get("estimatedRows"), log.get("success", False),
-                log.get("errorCode"), log.get("errorMsg"),
-                log.get("durationMs", 0),
-            )
+    _save_step_logs(run_id, step_logs)
 
     return {
         "success": success,

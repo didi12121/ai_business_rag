@@ -46,21 +46,27 @@ def validate_and_fix_plan(plan: dict, question: str, max_limit: int = 100) -> di
                 elif mc == "shipment_quantity":
                     step["sort"] = [{"field": "shipment_quantity", "direction": "desc"}]
 
-        # Check filters for interrogative garbage
-        for f in step.get("filters", []):
+        # Check filters for interrogative garbage — rebuild clean list
+        dirty_filters = step.get("filters", [])
+        clean_filters = []
+        for f in dirty_filters:
+            is_dirty = False
             if isinstance(f, str):
                 for bad in _BAD_FILTERS:
                     if bad in f:
                         errors.append(f"Step {sid}: filter 包含疑问词 '{bad}' → 已清除")
-                        step["filters"].remove(f)
+                        is_dirty = True
                         break
             elif isinstance(f, dict):
                 fv = str(f.get("value", "")).lower()
                 for bad in _BAD_FILTERS:
                     if bad in fv:
                         errors.append(f"Step {sid}: filter 包含疑问词 '{bad}' → 已清除")
-                        step["filters"].remove(f)
+                        is_dirty = True
                         break
+            if not is_dirty:
+                clean_filters.append(f)
+        step["filters"] = clean_filters
 
         # Limit enforcement
         slimit = step.get("limit")

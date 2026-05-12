@@ -15,6 +15,7 @@ FORBIDDEN_KEYWORDS = [
 _MODIFICATION_KEYWORDS = [
     "修改", "删除", "新增", "添加", "插入", "更新", "清空",
     "重置", "改成", "设为", "调整价格", "删除记录", "清空库存",
+    "改价格", "改单价", "保存", "写入", "导入", "覆盖", "批量修改",
 ]
 
 
@@ -39,6 +40,7 @@ def _load_allowed_tables(free_sql: bool = False) -> set[str]:
                     "WHERE enabled = 1 AND allow_query = 1"
                 )
             ).fetchall()
+            return {row[0] for row in rows}
         else:
             rows = db.execute(
                 text(
@@ -46,7 +48,7 @@ def _load_allowed_tables(free_sql: bool = False) -> set[str]:
                     "WHERE enabled = 1"
                 )
             ).fetchall()
-        return {row[0] for row in rows} | AI_META_TABLES
+            return {row[0] for row in rows} | AI_META_TABLES
     finally:
         db.close()
 
@@ -108,20 +110,18 @@ def check_sql_safety(sql: str, max_rows: int = 200, is_free_sql: bool = False) -
             raise ValueError(f"不允许访问表：{tbl}")
 
     # LIMIT enforcement
-    if "limit" not in lower:
+    limit_m = re.search(r"\blimit\s+(\d+)", lower)
+    if not limit_m:
         sql = stripped.rstrip(";") + f" LIMIT {max_rows}"
     else:
-        # Check and cap existing LIMIT
-        m = re.search(r"\blimit\s+(\d+)", lower)
-        if m:
-            existing_limit = int(m.group(1))
-            if existing_limit > max_rows:
-                sql = re.sub(
-                    r"\bLIMIT\s+\d+",
-                    f"LIMIT {max_rows}",
-                    stripped,
-                    flags=re.IGNORECASE,
-                )
+        existing_limit = int(limit_m.group(1))
+        if existing_limit > max_rows:
+            sql = re.sub(
+                r"\bLIMIT\s+\d+",
+                f"LIMIT {max_rows}",
+                stripped,
+                flags=re.IGNORECASE,
+            )
 
     return sql
 

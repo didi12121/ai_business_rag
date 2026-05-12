@@ -300,22 +300,26 @@ async def ask(req: AskRequest):
                 "errorCode": "UNSUPPORTED_OPERATION", "errorMsg": "拒绝修改类请求"}
 
     # Agent mode (priority when enabled)
+    agent_attempted = False
     if config.get("agent.enabled", True):
-        from app.core.data_agent import run_data_agent
-        result = await run_data_agent(question, req.sessionId, req.userId, show_sql)
-        result["durationMs"] = _now() - t0
-        # Also write ai_chat_log
-        _save_chat_log(
-            req.sessionId, req.userId, question,
-            "agent", {}, {}, result.get("sql"), result.get("rows", []),
-            result["answer"], result["success"],
-            result.get("errorMsg", ""),
-            result["durationMs"], query_mode="agent",
-            used_tables=result.get("usedTables"),
-            risk_level=result.get("riskLevel"),
-            estimated_rows=result.get("estimatedRows"),
-        )
-        return result
+        agent_attempted = True
+        try:
+            from app.core.data_agent import run_data_agent
+            result = await run_data_agent(question, req.sessionId, req.userId, show_sql)
+            result["durationMs"] = _now() - t0
+            if result.get("success"):
+                _save_chat_log(
+                    req.sessionId, req.userId, question,
+                    "agent", {}, {}, result.get("sql"), result.get("rows", []),
+                    result["answer"], True, "", result["durationMs"],
+                    query_mode="agent",
+                )
+                return result
+            elif result.get("errorCode") == "REJECTED":
+                return result
+            # Agent failed non-rejection → fall through to template/free_sql
+        except Exception as e:
+            pass  # fall through
 
     # 1. Quick intent match
     intent_result = quick_intent_match(question)
