@@ -416,9 +416,3 @@ def config_refresh():
     return {"success": True, "message": "AI配置缓存已刷新", "config": config}
 
 
-@router.post("/memory/clear")
-def memory_clear(body: dict):
-    from app.core.conversation_memory import clear_context
-    sid = body.get("sessionId", "")
-    clear_context(sid)
-    return {"success": True, "message": "上下文已清空"}

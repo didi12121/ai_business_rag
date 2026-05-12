@@ -73,6 +73,7 @@ async def ws_chat(ws: WebSocket):
             return
 
         # Agent mode (priority)
+        agent_failed = False
         if config.get("agent.enabled", True):
             from app.core.conversation_memory import get_context
             from app.core.data_agent import run_data_agent
@@ -85,17 +86,45 @@ async def ws_chat(ws: WebSocket):
                 except Exception:
                     pass
 
-            await run_data_agent(
+            # Don't let event_cb send done again in fallback
+            agent_done_emitted = False
+
+            async def event_cb_agent(payload: dict):
+                nonlocal agent_done_emitted
+                if payload.get("event") == "done":
+                    agent_done_emitted = True
+                try:
+                    await _send(ws, payload["event"], payload)
+                except Exception:
+                    pass
+
+            result = await run_data_agent(
                 question=question,
                 session_id=session_id,
                 user_id=None,
                 show_sql=show_sql,
-                event_callback=event_cb,
+                event_callback=event_cb_agent,
                 conversation_context=ctx,
             )
-            # run_data_agent already emitted done/error — close normally
-            await ws.close()
-            return
+
+            if result.get("success"):
+                if not agent_done_emitted:
+                    await _send(ws, "done", result)
+                await ws.close()
+                return
+            elif result.get("errorCode") == "REJECTED":
+                await ws.close()
+                return
+            else:
+                # Agent failed — fallback
+                agent_failed = True
+                await _send(ws, "fallback_start", {
+                    "reason": result.get("errorMsg", "Agent 无法回答"),
+                    "errorCode": result.get("errorCode", "AGENT_ERROR"),
+                })
+
+        if not agent_failed:
+            pass  # Agent not enabled or not attempted
 
         # 1. Intent
         await _send(ws, "thinking", {"step": "intent", "text": "正在识别查询意图..."})
@@ -226,8 +255,11 @@ async def ws_chat(ws: WebSocket):
             return
 
         sql = free_result["sql"]
+        bind_params = free_result.get("params")
+        if not isinstance(bind_params, dict):
+            bind_params = {}
         await _send(ws, "sql_ready", {
-            "sql": sql,
+            "sql": build_display_sql(sql, bind_params),
             "template": "自由 SQL 查询",
         })
 
@@ -247,7 +279,7 @@ async def ws_chat(ws: WebSocket):
             db = SessionLocal()
             try:
                 from sqlalchemy import text as sa_text
-                explain_result = db.execute(sa_text(f"EXPLAIN {sql}")).fetchall()
+                explain_result = db.execute(sa_text(f"EXPLAIN {sql}"), bind_params).fetchall()
                 total = 0
                 for r in explain_result:
                     try:
@@ -276,7 +308,7 @@ async def ws_chat(ws: WebSocket):
             from sqlalchemy import text as sa_text
             db.execute(sa_text("SET SESSION max_execution_time = :t"),
                        {"t": config.get("sql.timeout_seconds", 10) * 1000})
-            result = db.execute(sa_text(sql))
+            result = db.execute(sa_text(sql), bind_params)
             rows_raw = result.fetchall()
             columns = list(result.keys())
             rows = [dict(zip(columns, r)) for r in rows_raw]

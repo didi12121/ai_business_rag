@@ -11,6 +11,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.api.ask import router as ask_router
 from app.api.ws import router as ws_router
+from app.api.memory import router as memory_router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -37,6 +38,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 app.include_router(ask_router)
 app.include_router(ws_router)
+app.include_router(memory_router)
 
 
 @app.get("/", response_class=HTMLResponse)
