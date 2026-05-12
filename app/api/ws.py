@@ -80,13 +80,7 @@ async def ws_chat(ws: WebSocket):
 
             ctx = get_context(session_id, max_turns=5)
 
-            async def event_cb(payload: dict):
-                try:
-                    await _send(ws, payload["event"], payload)
-                except Exception:
-                    pass
-
-            # Don't let event_cb send done again in fallback
+            # Track if done was already emitted by data_agent
             agent_done_emitted = False
 
             async def event_cb_agent(payload: dict):

@@ -184,8 +184,12 @@ async function ask(question) {
       case 'step_error': addStep('step' + data.stepId, '❌', 'S' + data.stepId + ' 失败: ' + (data.errorCode || '') + ' — ' + (data.errorMsg || ''), 'done'); break;
       case 'answer_start': addStep('answer', '⏳', data.text || '生成回答中...', 'running'); break;
       case 'answer_chunk': answerText += data.text; setAiBubble(escapeHtml(answerText).replace(/\n/g, '<br>')); break;
+      case 'answer_done':
+        if (!answerText && data.answer) { answerText = data.answer; setAiBubble(escapeHtml(answerText).replace(/\n/g, '<br>')); }
+        addStep('answer', '✅', '回答完成', 'done'); break;
       case 'done':
         meta.durationMs = data.durationMs; meta.queryMode = data.queryMode; if (data.plan) meta.plan = data.plan;
+        if (!answerText && data.answer) answerText = data.answer;
         finishAiMsg(answerText, meta); sendBtn.disabled = false; socket.close(); break;
       case 'error': showError(data.message || data.errorMsg || '未知错误'); socket.close(); break;
     }
