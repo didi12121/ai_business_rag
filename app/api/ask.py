@@ -1,10 +1,13 @@
 import json
+import logging
 import time
 from datetime import date, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter
 from sqlalchemy import text
+
+logger = logging.getLogger("ai_business_rag")
 
 from app.database import SessionLocal
 from app.models.request import AskRequest
@@ -158,6 +161,9 @@ async def run_free_sql_query(question, show_sql):
             "answer": "LLM 未生成 SQL", "errorCode": "FREE_SQL_GENERATE_FAILED",
             "errorMsg": "LLM 返回空 SQL",
         }
+    bind_params = free_result.get("params")
+    if not isinstance(bind_params, dict):
+        bind_params = {}
 
     # Safety check
     try:
@@ -177,7 +183,7 @@ async def run_free_sql_query(question, show_sql):
     if config.get("free_sql.explain_before_run", True):
         db = SessionLocal()
         try:
-            explain_result = db.execute(text(f"EXPLAIN {sql}")).fetchall()
+            explain_result = db.execute(text(f"EXPLAIN {sql}"), bind_params).fetchall()
             total = 0
             for r in explain_result:
                 try:
@@ -213,7 +219,7 @@ async def run_free_sql_query(question, show_sql):
     try:
         db.execute(text("SET SESSION max_execution_time = :t"),
                    {"t": config.get("sql.timeout_seconds", 10) * 1000})
-        result = db.execute(text(sql))
+        result = db.execute(text(sql), bind_params)
         rows_raw = result.fetchall()
         columns = list(result.keys())
         rows = [dict(zip(columns, r)) for r in rows_raw]
@@ -246,7 +252,7 @@ async def run_free_sql_query(question, show_sql):
             "errorMsg": str(e),
         }
 
-    display_sql = build_display_sql(sql, free_result.get("params", {})) if show_sql else None
+    display_sql = build_display_sql(sql, bind_params) if show_sql else None
     return {
         "success": True, "question": question, "queryMode": "free_sql",
         "intent": "free_sql", "confidence": 0, "params": {},
@@ -319,7 +325,18 @@ async def ask(req: AskRequest):
                 return result
             # Agent failed non-rejection → fall through to template/free_sql
         except Exception as e:
-            pass  # fall through
+            logger.exception("Agent failed, fallback to template/free_sql")
+            try:
+                _save_chat_log(
+                    req.sessionId, req.userId, question,
+                    "agent", {}, {}, None, [],
+                    "", False, str(e),
+                    int((time.time() - t0) * 1000),
+                    query_mode="agent",
+                )
+            except Exception:
+                pass
+            # fall through to template/free_sql
 
     # 1. Quick intent match
     intent_result = quick_intent_match(question)

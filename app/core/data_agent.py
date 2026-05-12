@@ -120,12 +120,39 @@ async def run_data_agent(
     plan = validate_and_fix_plan(plan, question, max_limit=default_limit)
     steps = plan.get("steps", [])
 
+    def _dependency_satisfied(step: dict, observations: list[dict]) -> tuple:
+        depends_on = step.get("dependsOn")
+        if not depends_on:
+            return True, None
+        obs = next((o for o in observations if str(o.get("stepId")) == str(depends_on)), None)
+        if not obs:
+            return False, f"依赖步骤 {depends_on} 没有成功结果"
+        if not obs.get("success", True):
+            return False, f"依赖步骤 {depends_on} 执行失败"
+        if int(obs.get("rowCount") or 0) <= 0:
+            return False, f"依赖步骤 {depends_on} 查询结果为空"
+        return True, None
+
     observations = []
     step_logs = []
 
     for step in steps[:max_steps]:
         step_t0 = time.time()
         sid = step.get("stepId", len(observations) + 1)
+
+        # Check dependency
+        ok, reason = _dependency_satisfied(step, observations)
+        if not ok:
+            step_logs.append(dict(
+                stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                success=False, errorCode="SKIPPED_DEPENDENCY", errorMsg=reason,
+                sql=None, rowCount=0, rowsPreview=[],
+                usedTables=[], riskLevel="low",
+                durationMs=int((time.time() - step_t0) * 1000),
+            ))
+            if step.get("required", True):
+                break
+            continue
 
         # Build SQL — pass rowsPreview from previous observations
         sql_result = await build_step_sql(question, plan, step, observations)
@@ -234,6 +261,7 @@ async def run_data_agent(
         observation = {
             "stepId": sid, "name": step.get("name", ""),
             "purpose": step.get("purpose", ""),
+            "success": True,
             "sql": display_sql if config.get("agent.show_step_sql", True) else None,
             "rows": normalized_rows[:20],
             "rowCount": len(rows),
@@ -254,12 +282,35 @@ async def run_data_agent(
             durationMs=step_duration,
         ))
 
+    # Compute success state
+    successful_steps = [s for s in step_logs if s.get("success")]
+    failed_steps = [s for s in step_logs if not s.get("success")]
+    all_ok = len(successful_steps) > 0 and len(failed_steps) == 0
+    partial_success = len(successful_steps) > 0 and len(failed_steps) > 0
+    all_failed = len(successful_steps) == 0
+
+    if all_failed:
+        success = False
+        error_code = "AGENT_ALL_STEPS_FAILED"
+        error_msg = "所有步骤均失败"
+    elif partial_success:
+        success = True
+        error_code = None
+        error_msg = ""
+    else:
+        success = all_ok
+        error_code = None if all_ok else "AGENT_ERROR"
+        error_msg = "" if all_ok else "部分步骤失败"
+
     # Generate final answer
-    success = False
     if observations:
         try:
-            answer = await generate_final_answer(question, plan, observations)
-            success = any(s.get("success") for s in step_logs)
+            answer = await generate_final_answer(
+                question, plan, observations,
+                successful_steps=successful_steps,
+                failed_steps=failed_steps,
+                partial_success=partial_success,
+            )
         except Exception as e:
             answer = f"回答生成失败：{e}"
     else:
@@ -267,9 +318,7 @@ async def run_data_agent(
 
     duration_ms = int((time.time() - t0) * 1000)
 
-    # Save logs (after we know success status)
-    error_code = None if success else "AGENT_ERROR"
-    error_msg = "" if success else "部分或全部步骤失败"
+    # Save logs
     run_id = _save_agent_run(
         session_id, user_id, question, plan, answer,
         success, error_code, error_msg, duration_ms,
@@ -278,6 +327,7 @@ async def run_data_agent(
 
     return {
         "success": success,
+        "partialSuccess": partial_success,
         "queryMode": "agent",
         "question": question,
         "answer": answer,

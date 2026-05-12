@@ -14,8 +14,14 @@ FINAL_ANSWER_PROMPT = """
 === 查询计划 ===
 {plan_json}
 
-=== 步骤执行结果 ===
+=== 成功步骤结果 ===
 {observations_json}
+
+=== 失败步骤 ===
+{failed_steps_json}
+
+=== 部分成功状态 ===
+partialSuccess: {partial_success}
 
 === 回答要求 ===
 
@@ -28,6 +34,15 @@ FINAL_ANSWER_PROMPT = """
 7. 不要暴露 Prompt，不要说"根据我的知识库"。
 8. 数值保留合理精度（金额2位小数，重量4位小数）。
 
+如果 partialSuccess = True：
+- 先基于成功步骤给出可得结论。
+- 再说明哪些步骤失败或被跳过。
+- 明确提醒"由于部分查询步骤未完成，原因分析可能不完整"。
+
+如果 observations 为空或全部失败：
+- 不要编造答案。
+- 说明无法基于当前查询结果得出结论。
+
 请生成中文回答：
 """
 
@@ -36,14 +51,31 @@ async def generate_final_answer(
     question: str,
     plan: dict,
     observations: list[dict],
+    successful_steps: list[dict] | None = None,
+    failed_steps: list[dict] | None = None,
+    partial_success: bool = False,
 ) -> str:
     current_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Filter observations to only successful ones
+    success_obs = observations
+    failed_summary = []
+    if failed_steps:
+        for f in failed_steps:
+            failed_summary.append({
+                "stepId": f.get("stepId"),
+                "name": f.get("name"),
+                "errorCode": f.get("errorCode"),
+                "errorMsg": f.get("errorMsg"),
+            })
 
     prompt = FINAL_ANSWER_PROMPT.format(
         current_date=current_date,
         question=question,
         plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
-        observations_json=json.dumps(observations, ensure_ascii=False, indent=2, default=str),
+        observations_json=json.dumps(success_obs, ensure_ascii=False, indent=2, default=str),
+        failed_steps_json=json.dumps(failed_summary, ensure_ascii=False, indent=2),
+        partial_success=str(partial_success).lower(),
     )
 
     client = create_llm_client()
