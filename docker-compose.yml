@@ -1,9 +1,9 @@
 services:
-  ai-business-rag:
+  ai-business-rag2:
     build: .
     container_name: ai-business-rag
     ports:
-      - "7004:8105"
+      - "7006:8105"
     env_file:
       - .env
     restart: unless-stopped
