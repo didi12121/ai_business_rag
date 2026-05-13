@@ -14,6 +14,10 @@ SQL_BUILDER_PROMPT = """
 
 {table_schemas}
 
+=== 业务指标定义 ===
+
+{metric_definitions}
+
 === 业务规则 ===
 
 {business_rules}
@@ -54,6 +58,13 @@ SQL_BUILDER_PROMPT = """
 17. shipment_quantity 用 kuang_num 或 num 或 quantity 字段。
 18. 不要编造不存在的字段，不确定就 canGenerate=false。
 19. 返回严格 JSON，不要 Markdown。
+
+=== 反例（禁止） ===
+- ORDER BY total_weight DESC 用于"出货金额最高" → 错误，应按 amount 排序
+- SUM(apr.total_price) AS total_amount → 错误，total_price 不存在
+- api.unit_price AS total_amount → 错误，单价不是金额
+- api.ad_product_name LIKE '%哪个产品%' → 错误，疑问词不是产品名
+- 不使用指标公式自己拼金额 → 错误，必须用 metric_definition 中的表达式
 
 === 返回格式 ===
 
@@ -116,6 +127,8 @@ async def build_step_sql(
     schema_text = _build_schema_text()
     rules = load_business_rules()
     rules_text = json.dumps([r.get("rule_content", "") for r in rules], ensure_ascii=False)
+    from app.core.metric_context import build_metric_prompt_section
+    metric_section = build_metric_prompt_section()
     current_date = datetime.now().strftime("%Y-%m-%d")
 
     # Summarize previous observations
@@ -143,6 +156,7 @@ async def build_step_sql(
     prompt = SQL_BUILDER_PROMPT.format(
         current_date=current_date,
         table_schemas=schema_text,
+        metric_definitions=metric_section or "无",
         business_rules=rules_text,
         conversation_context=ctx_text,
         question=question,

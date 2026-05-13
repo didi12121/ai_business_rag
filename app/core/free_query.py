@@ -19,6 +19,10 @@ FREE_SQL_PROMPT = """
 
 {table_schemas}
 
+=== 业务指标定义 ===
+
+{metric_definitions}
+
 === 表关系说明 ===
 - ad_factory_info.factory_info_id → ad_product_info.ad_factory_info_id → ad_product_parts.ad_factory_info_id
 - ad_product_info.ad_product_info_id → ad_product_parts.ad_product_info_id → ad_order_item.ad_product_info_id
@@ -43,6 +47,8 @@ FREE_SQL_PROMPT = """
 9. 必须加 LIMIT，默认 LIMIT {max_rows}。
 10. 如果问题涉及修改/删除，canGenerate = false。
 11. 如果缺少必要字段无法生成可靠 SQL，canGenerate = false。
+12. "出货金额"必须使用指标定义中的 shipment_amount 公式，禁止用 total_price/amount 等不存在字段。
+13. "金额最高"排序必须用 amount 别名，禁止按 total_weight 排序。
 
 === 用户问题 ===
 {question}
@@ -123,12 +129,15 @@ async def generate_free_sql(question: str) -> dict:
         [r.get("rule_content", "") for r in business_rules],
         ensure_ascii=False,
     )
+    from app.core.metric_context import build_metric_prompt_section
+    metric_section = build_metric_prompt_section()
     current_date = datetime.now().strftime("%Y-%m-%d")
 
     prompt = FREE_SQL_PROMPT.format(
         current_date=current_date,
         max_rows=config.get("free_sql.max_rows", 200),
         table_schemas=schema_text,
+        metric_definitions=metric_section or "无",
         business_rules=rules_text,
         question=question,
     )
@@ -148,9 +157,15 @@ async def generate_free_sql(question: str) -> dict:
             "riskLevel": "high",
         }
 
+    sql = result.get("sql")
+    # Enforce del_flag = '0'
+    if sql and result.get("canGenerate"):
+        from app.core.sql_enhancer import enforce_del_flag
+        sql = enforce_del_flag(sql)
+
     return {
         "canGenerate": result.get("canGenerate", False),
-        "sql": result.get("sql"),
+        "sql": sql,
         "params": result.get("params", {}),
         "reason": result.get("reason", ""),
         "usedTables": result.get("usedTables", []),

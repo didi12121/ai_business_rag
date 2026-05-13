@@ -17,6 +17,10 @@ PLANNER_PROMPT = """
 
 {table_overview}
 
+=== 业务指标定义 ===
+
+{metric_definitions}
+
 === 业务规则 ===
 
 {business_rules}
@@ -141,6 +145,10 @@ async def generate_query_plan(
     )
     current_date = datetime.now().strftime("%Y-%m-%d")
 
+    # Load metric definitions
+    from app.core.metric_context import build_metric_prompt_section
+    metric_section = build_metric_prompt_section()
+
     # Build context string
     context_text = ""
     if conversation_context:
@@ -154,6 +162,7 @@ async def generate_query_plan(
     prompt = PLANNER_PROMPT.format(
         current_date=current_date,
         table_overview=overview,
+        metric_definitions=metric_section or "无",
         business_rules=rules_text,
         conversation_context=context_text or "无上下文",
         question=question,

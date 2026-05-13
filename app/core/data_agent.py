@@ -181,6 +181,9 @@ async def run_data_agent(
         sql_result = await build_step_sql(question, plan, step, observations, conversation_context)
         step_sql = sql_result.get("sql")
         bind_params = sql_result.get("params") or {}
+        # Enforce del_flag = '0' on all tables that have it
+        from app.core.sql_enhancer import enforce_del_flag
+        step_sql = enforce_del_flag(step_sql)
 
         await _emit(cb, "sql_generated", stepId=sid,
                     sql=step_sql, usedTables=sql_result.get("usedTables", []),
