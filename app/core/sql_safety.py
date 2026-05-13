@@ -53,6 +53,74 @@ def _load_allowed_tables(free_sql: bool = False) -> set[str]:
         db.close()
 
 
+# System fields that exist on every RuoYi table, don't require ai_field_schema entry
+_BUILTIN_FIELDS = {
+    "del_flag", "create_time", "create_by", "update_time", "update_by",
+    "remark", "order_no", "out_id",
+}
+
+# Known SQL functions/operators that can precede a column reference
+_SQL_FUNCTIONS = {
+    "sum", "avg", "min", "max", "count", "coalesce", "nullif", "ifnull",
+    "concat", "group_concat", "cast", "convert", "if", "case", "when", "then",
+    "else", "end", "distinct", "as", "on", "and", "or", "in", "not", "is",
+    "null", "like", "between", "exists", "asc", "desc", "separator",
+}
+
+
+@lru_cache(maxsize=1)
+def _load_field_map() -> dict[str, set[str]]:
+    """Return {table_name: {field_name, ...}} from ai_field_schema."""
+    db = SessionLocal()
+    try:
+        rows = db.execute(text(
+            "SELECT table_name, field_name FROM ai_field_schema WHERE enabled = 1"
+        )).fetchall()
+        field_map: dict[str, set[str]] = {}
+        for r in rows:
+            field_map.setdefault(r[0], set()).add(r[1].lower())
+        return field_map
+    finally:
+        db.close()
+
+
+def _extract_alias_map(sql: str) -> dict[str, str]:
+    """Extract alias → table_name mapping."""
+    mapping: dict[str, str] = {}
+    for m in re.finditer(
+        r"(?:from|join)\s+`?(\w+)`?\s+(?:AS\s+)?(\w+)",
+        sql, re.IGNORECASE,
+    ):
+        table = m.group(1).lower()
+        alias = m.group(2).lower()
+        if alias not in _SQL_FUNCTIONS and alias not in ("where", "group", "order", "limit", "having"):
+            mapping[alias] = table
+    return mapping
+
+
+def _validate_fields(sql: str, allowed_tables: set[str]):
+    """Check that alias.column references exist in ai_field_schema."""
+    field_map = _load_field_map()
+    alias_map = _extract_alias_map(sql)
+
+    # Find all alias.column patterns
+    col_refs = re.findall(r"(\w+)\.(\w+)", sql.lower())
+    for alias, col in col_refs:
+        if alias in _SQL_FUNCTIONS:
+            continue
+        table = alias_map.get(alias, alias)
+        if table not in field_map:
+            continue  # Skip if table not in field schema (e.g. derived tables)
+        valid_fields = field_map[table]
+        # Builtin system fields are always allowed
+        if col in _BUILTIN_FIELDS:
+            continue
+        if col not in valid_fields:
+            raise ValueError(
+                f"字段不存在：{alias}.{col}（表 {table} 中没有此字段，可用字段: {', '.join(sorted(valid_fields)[:20])}...）"
+            )
+
+
 def _extract_tables(sql: str) -> set[str]:
     """Extract table names from FROM/JOIN clauses, supporting:
     - plain: ad_product_info
@@ -108,6 +176,9 @@ def check_sql_safety(sql: str, max_rows: int = 200, is_free_sql: bool = False) -
     for tbl in used_tables:
         if tbl not in allowed:
             raise ValueError(f"不允许访问表：{tbl}")
+
+    # Field validation: check alias.column references exist in ai_field_schema
+    _validate_fields(sql, used_tables)
 
     # LIMIT enforcement
     limit_m = re.search(r"\blimit\s+(\d+)", lower)

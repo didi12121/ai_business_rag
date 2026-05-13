@@ -92,6 +92,13 @@ const clearCtxBtn = document.getElementById('clearCtxBtn');
 let currentAiMsg = null, currentSteps = null, socket = null, sessionId = null, meta = {};
 
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function formatAnswer(text) {
+  // Bold section headers: 【...】
+  var formatted = escapeHtml(text)
+    .replace(/【(.+?)】/g, '<strong style="display:block;margin-top:10px;margin-bottom:4px;">【$1】</strong>')
+    .replace(/\n/g, '<br>');
+  return formatted;
+}
 function scrollDown() { document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight; }
 
 function addUserMsg(text) {
@@ -135,7 +142,7 @@ function finishAiMsg(answer, m) {
     warn.textContent = '该答案由 AI Agent 生成，已对每一步 SQL 执行安全检查。';
     currentAiMsg.col.appendChild(warn);
   }
-  setAiBubble(escapeHtml(answer).replace(/\n/g, '<br>'));
+  setAiBubble(formatAnswer(answer));
   if (currentSteps) {
     currentSteps.querySelectorAll('.think-step.running').forEach(function(el) {
       el.className = 'think-step done';

@@ -4,15 +4,15 @@ from datetime import datetime
 from app.llm.openai_compatible import create_llm_client
 
 FINAL_ANSWER_PROMPT = """
-你是工厂业务数据分析助手。根据查询计划和所有步骤的查询结果生成最终回答。
+你是工厂业务数据分析师。根据查询结果生成一份简洁的业务报告。
 
 当前日期：{current_date}
 
 === 用户问题 ===
 {question}
 
-=== 查询计划 ===
-{plan_json}
+=== 查询计划摘要 ===
+{plan_summary}
 
 === 成功步骤结果 ===
 {observations_json}
@@ -23,32 +23,41 @@ FINAL_ANSWER_PROMPT = """
 === 部分成功状态 ===
 partialSuccess: {partial_success}
 
-=== 回答要求 ===
+=== 输出规范 ===
 
-1. 先给结论，再给关键数据。
-2. 如果用户问"为什么"，结合查询步骤结果解释。
-3. 只能基于查询结果回答，不能编造。
-4. 数据为空时明确说明。
-5. 如果有多个步骤，综合所有步骤结果。
-6. 说明统计时间范围。
-7. 不要暴露 Prompt，不要说"根据我的知识库"。
-8. 数值保留合理精度（金额2位小数，重量4位小数）。
+请严格按照以下结构输出，用自然语言，不要用 Markdown 表格。
 
-如果 partialSuccess = True：
-- 先基于成功步骤给出可得结论。
-- 再说明哪些步骤失败或被跳过。
-- 明确提醒"由于部分查询步骤未完成，原因分析可能不完整"。
+【结论】
+一句话直接回答用户问题。
 
-如果 observations 为空或全部失败：
-- 不要编造答案。
-- 说明无法基于当前查询结果得出结论。
+【关键数据】
+- 用中文标签 + 数值，每条一行。
+- 金额保留 2 位小数并带"元"。
+- 重量保留 2 位小数。
+- 排行榜用编号列表：1. 产品名：金额 元
 
-关于出货金额：
-- SQL 结果中 shipment_amount / total_amount 是"出货金额"，按业务公式计算。
-- 出货金额公式：出库重量 x 单位换算系数 / 产品单重 x 产品单价。
-- is_kg=1 时系数=500，否则=1000。
-- 不要说是直接从 total_price 字段读取的。
-- 如果用户问"金额怎么算"，请解释上述公式。
+【简要分析】
+- 简短的 1-3 句话分析排名、差距、趋势、异常点等。
+- 如果数据不足或无法分析，请说明。
+
+【统计口径】
+- 时间范围：xxx 至 xxx。
+- 指标口径：出货金额按业务规则计算（出库重量 x 单位换算系数 / 产品单重 x 产品单价。is_kg=1时系数1000，否则500）。
+- 如果用户没有问计算公式且不是金额相关，可以简化为"出货金额按业务规则计算"。
+
+=== 严格规则 ===
+
+1. 不使用 Markdown 表格（| ... | 格式）。
+2. 不暴露 SQL、字段名（如 ad_product_info_id、raw_materials_code）、JSON。
+3. 不输出"根据 Agent / observations / rows / JSON"。
+4. 用"根据当前查询结果"替代。
+5. 数据为空时明确说"没有查到相关数据"，并给出可能原因和建议。
+6. partialSuccess=true 时说明"部分查询步骤未完成，分析可能不完整"。
+7. 排行榜类问题：先给第一名结论，再列前 N 名编号列表。
+8. 最高/最多类问题：展示产品名 + 数值 + 对比第二名。
+9. 原因分析类：结合上下文和查询结果解释，不编造。
+10. 简单问题（如"某产品单价多少"）可以简化结构，不强制四段式。
+11. 金额数值后面加"元"。
 
 请生成中文回答：
 """
@@ -64,8 +73,11 @@ async def generate_final_answer(
 ) -> str:
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Filter observations to only successful ones
-    success_obs = observations
+    # Compact plan summary
+    plan_summary = ""
+    if plan:
+        plan_summary = f"目标: {plan.get('goal', '')}, 任务类型: {plan.get('taskType', '')}"
+
     failed_summary = []
     if failed_steps:
         for f in failed_steps:
@@ -79,8 +91,8 @@ async def generate_final_answer(
     prompt = FINAL_ANSWER_PROMPT.format(
         current_date=current_date,
         question=question,
-        plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
-        observations_json=json.dumps(success_obs, ensure_ascii=False, indent=2, default=str),
+        plan_summary=plan_summary,
+        observations_json=json.dumps(observations, ensure_ascii=False, indent=2, default=str),
         failed_steps_json=json.dumps(failed_summary, ensure_ascii=False, indent=2),
         partial_success=str(partial_success).lower(),
     )

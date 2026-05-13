@@ -59,12 +59,25 @@ SQL_BUILDER_PROMPT = """
 18. 不要编造不存在的字段，不确定就 canGenerate=false。
 19. 返回严格 JSON，不要 Markdown。
 
+=== 实体消歧规则 ===
+
+用户问题中可能同时包含厂家名和产品名，必须正确分配字段：
+
+1. 带"圈/厂/行/公司/商行/实业/塑胶/塑料/五金"后缀的通常是**厂家名** → factory_name LIKE
+2. 带字母数字编码的（如 ws-01-abs, TDX-01, M30, 690, HL2024）通常是**产品名/型号** → ad_product_name LIKE
+3. 纯颜色词（黄/红/蓝/绿/黑/白/灰）且出现在产品名中不算独立颜色，单独的"黄色/红色"才是 color
+4. 如果产品名中包含颜色（如"黄ABS"），直接用 ad_product_name LIKE '%黄ABS%' 而不要拆成 color
+5. 如果产品名中包含厂家简称（如"妙趣圈的ws-01-abs"），"妙趣圈"是厂家，"ws-01-abs"是产品名
+6. 不确定实体类型时，用 LIKE 模糊匹配所有可能字段，或返回 canGenerate=false
+7. 必须 JOIN 相关表（查厂家要 JOIN ad_factory_info，查产品要 JOIN ad_product_info）
+
 === 反例（禁止） ===
 - ORDER BY total_weight DESC 用于"出货金额最高" → 错误，应按 amount 排序
 - SUM(apr.total_price) AS total_amount → 错误，total_price 不存在
 - api.unit_price AS total_amount → 错误，单价不是金额
 - api.ad_product_name LIKE '%哪个产品%' → 错误，疑问词不是产品名
 - 不使用指标公式自己拼金额 → 错误，必须用 metric_definition 中的表达式
+- ad_product_name LIKE '%妙趣圈%' AND color = 'ws-01-abs' → 错误，厂家名当产品名、产品名当颜色
 
 === 返回格式 ===
 

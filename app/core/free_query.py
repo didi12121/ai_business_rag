@@ -50,6 +50,12 @@ FREE_SQL_PROMPT = """
 12. "出货金额"必须使用指标定义中的 shipment_amount 公式，禁止用 total_price/amount 等不存在字段。
 13. "金额最高"排序必须用 amount 别名，禁止按 total_weight 排序。
 
+=== 实体消歧 ===
+- 带"圈/厂/行/公司/商行/实业/塑胶"后缀的是厂家名 → factory_name
+- 带字母数字编码的是产品名/型号 → ad_product_name
+- 纯颜色词才是 color 字段；"黄ABS"是产品名不是颜色
+- 不确定时用 LIKE 模糊匹配所有可能字段，或返回 canGenerate=false
+
 === 用户问题 ===
 {question}
 
