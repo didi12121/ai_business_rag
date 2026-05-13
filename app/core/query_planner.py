@@ -17,6 +17,10 @@ PLANNER_PROMPT = """
 
 {table_overview}
 
+=== 表关系（决定 JOIN 哪些表） ===
+
+{table_relations}
+
 === 业务指标定义 ===
 
 {metric_definitions}
@@ -57,6 +61,18 @@ PLANNER_PROMPT = """
     - 纯颜色词（黄/红/蓝/绿/黑/白/灰）且独立出现 → 可能是颜色筛选
     - "妙趣圈的ws-01-abs价格" → 妙趣圈=厂家, ws-01-abs=产品
 
+=== requiredTables 规则 ===
+24. 每个 step 必须包含 requiredTables 字段，列出本步骤需要的所有表。
+25. 涉及厂家过滤 → 包含 ad_factory_info
+26. 涉及产品名/颜色/原料 → 包含 ad_product_info
+27. 涉及出库/出货/重量/数量 → 包含 ad_product_record
+28. 涉及金额（shipment_amount） → 必须包含 ad_product_record + ad_product_info + ad_factory_info
+29. 涉及订单 → 包含 ad_order_info + ad_order_item
+30. 涉及配件/胶件 → 包含 ad_product_parts
+31. 涉及库存 → 包含 ad_month_inventory
+32. 如果查询只需单表（如"有哪些厂家"），requiredTables 只写那张表。
+33. 不要包含不存在的表名。
+
 === 对话上下文 ===
 
 {conversation_context}
@@ -84,7 +100,8 @@ PLANNER_PROMPT = """
       "groupBy": ["product"],
       "sort": [{{"field": "shipment_amount", "direction": "desc"}}],
       "limit": 10,
-      "dependsOn": null
+      "dependsOn": null,
+      "requiredTables": ["ad_product_record", "ad_product_info", "ad_factory_info"]
     }}
   ],
   "finalAnswerRequirement": "回答需要包含什么内容",
@@ -155,6 +172,8 @@ async def generate_query_plan(
     # Load metric definitions
     from app.core.metric_context import build_metric_prompt_section
     metric_section = build_metric_prompt_section()
+    from app.core.relation_context import build_relation_prompt_section
+    relation_section = build_relation_prompt_section()
 
     # Build context string
     context_text = ""
@@ -169,6 +188,7 @@ async def generate_query_plan(
     prompt = PLANNER_PROMPT.format(
         current_date=current_date,
         table_overview=overview,
+        table_relations=relation_section or "无",
         metric_definitions=metric_section or "无",
         business_rules=rules_text,
         conversation_context=context_text or "无上下文",

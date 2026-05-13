@@ -14,6 +14,18 @@ SQL_BUILDER_PROMPT = """
 
 {table_schemas}
 
+=== 表别名规范 ===
+
+{table_aliases}
+
+=== 可用表关系（JOIN 条件必须以此为准） ===
+
+{table_relations}
+
+=== 推荐JOIN路径 ===
+
+{join_paths}
+
 === 业务指标定义 ===
 
 {metric_definitions}
@@ -47,6 +59,12 @@ SQL_BUILDER_PROMPT = """
 6. 不要使用不存在的表或字段。
 7. 有 del_flag 的表必须加 del_flag = '0'。
 8. 时间范围使用闭开区间：record_time >= 'xxx' AND record_time < 'xxx'。
+9. **JOIN 规则**：如果推荐JOIN路径存在，必须按推荐路径生成 JOIN。不要自创 JOIN 条件。
+10. **表别名**：必须使用上述别名规范中的别名，不要用 p/t1/t2 等自创别名。
+11. 如果 step 涉及厂家过滤 → 必须 JOIN ad_factory_info。
+12. 如果 step 涉及产品原料/颜色/名称 → 必须 JOIN ad_product_info。
+13. 如果 step 涉及出库重量/数量 → 必须使用 ad_product_record。
+14. 如果推荐JOIN路径 canResolve=false 但需要多表 → 返回 canGenerate=false。
 9. 必须加 LIMIT。
 10. ranking 必须按 queryType 要求的 GROUP BY 和 ORDER BY。
 11. "哪个产品"不是产品名，不能生成 product_name LIKE '%哪个产品%'。
@@ -142,6 +160,21 @@ async def build_step_sql(
     rules_text = json.dumps([r.get("rule_content", "") for r in rules], ensure_ascii=False)
     from app.core.metric_context import build_metric_prompt_section
     metric_section = build_metric_prompt_section()
+    from app.core.relation_context import build_relation_prompt_section
+    relation_section = build_relation_prompt_section()
+    from app.core.table_alias import build_alias_prompt_section
+    alias_section = build_alias_prompt_section()
+    from app.core.join_resolver import resolve_join_paths
+    # Resolve JOIN paths if step has requiredTables, otherwise from metric
+    required = list(step.get("requiredTables", []))
+    if not required and step.get("metric") == "shipment_amount":
+        required = ["ad_product_record", "ad_product_info", "ad_factory_info"]
+    join_info = resolve_join_paths(required) if required else {"canResolve": False, "joins": [], "reason": ""}
+    join_paths_text = ""
+    if join_info.get("canResolve"):
+        join_paths_text = f"基础表: {join_info['baseTable']}\nJOIN路径:\n"
+        for j in join_info.get("joins", []):
+            join_paths_text += f"  {j['sql']}\n"
     current_date = datetime.now().strftime("%Y-%m-%d")
 
     # Summarize previous observations
@@ -169,6 +202,9 @@ async def build_step_sql(
     prompt = SQL_BUILDER_PROMPT.format(
         current_date=current_date,
         table_schemas=schema_text,
+        table_relations=relation_section or "无",
+        table_aliases=alias_section,
+        join_paths=join_paths_text or "无（单表查询）",
         metric_definitions=metric_section or "无",
         business_rules=rules_text,
         conversation_context=ctx_text,

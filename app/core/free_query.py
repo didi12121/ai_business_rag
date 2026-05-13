@@ -19,6 +19,14 @@ FREE_SQL_PROMPT = """
 
 {table_schemas}
 
+=== 表别名规范 ===
+
+{table_aliases}
+
+=== 表关系（JOIN 必须以此为准） ===
+
+{table_relations}
+
 === 业务指标定义 ===
 
 {metric_definitions}
@@ -137,12 +145,18 @@ async def generate_free_sql(question: str) -> dict:
     )
     from app.core.metric_context import build_metric_prompt_section
     metric_section = build_metric_prompt_section()
+    from app.core.relation_context import build_relation_prompt_section
+    relation_section = build_relation_prompt_section()
+    from app.core.table_alias import build_alias_prompt_section
+    alias_section = build_alias_prompt_section()
     current_date = datetime.now().strftime("%Y-%m-%d")
 
     prompt = FREE_SQL_PROMPT.format(
         current_date=current_date,
         max_rows=config.get("free_sql.max_rows", 200),
         table_schemas=schema_text,
+        table_relations=relation_section or "无",
+        table_aliases=alias_section,
         metric_definitions=metric_section or "无",
         business_rules=rules_text,
         question=question,
