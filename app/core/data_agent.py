@@ -13,6 +13,7 @@ from app.core.sql_safety import check_sql_safety, build_display_sql, is_modifica
 from app.core.query_planner import generate_query_plan
 from app.core.query_plan_validator import validate_and_fix_plan
 from app.core.agent_sql_builder import build_step_sql
+from app.core.sql_reviewer import review_sql
 from app.core.agent_answer import generate_final_answer
 from app.core.conversation_memory import add_turn
 
@@ -107,6 +108,8 @@ async def run_data_agent(
     explain_before = config.get("free_sql.explain_before_run", True)
     max_est_rows = config.get("free_sql.max_estimated_rows", 50000)
     timeout_sec = config.get("sql.timeout_seconds", 10)
+    review_enabled = config.get("sql_review.enabled", True)
+    review_max_retry = config.get("sql_review.max_retry", 1)
 
     # Reject modifications
     if is_modification_request(question):
@@ -203,6 +206,107 @@ async def run_data_agent(
                 durationMs=int((time.time() - step_t0) * 1000),
             ))
             continue
+
+        # SQL Semantic Review (agent mode only)
+        sql_review_result = None
+        if review_enabled:
+            retries_left = review_max_retry
+            while True:
+                # Build reviewer context
+                from app.core.business_context import load_table_schemas, load_field_schemas, load_business_rules
+                schemas = load_table_schemas()
+                fields = load_field_schemas()
+                schema_lines = []
+                for t in schemas:
+                    tname = t["table_name"]
+                    bname = t.get("business_name", "")
+                    desc = t.get("description", "")
+                    schema_lines.append(f"[{tname}] {bname}: {desc}")
+                    for f in fields:
+                        if f["table_name"] != tname:
+                            continue
+                        schema_lines.append(f"  {f['field_name']}: {f.get('business_name', '')} — {f.get('description', '')}")
+                schema_context = "\n".join(schema_lines)
+
+                rules = load_business_rules()
+                rules_text = json.dumps([r.get("rule_content", "") for r in rules], ensure_ascii=False)
+                from app.core.metric_context import build_metric_prompt_section
+                metric_section = build_metric_prompt_section()
+                from app.core.relation_context import build_relation_prompt_section
+                relation_section = build_relation_prompt_section()
+
+                await _emit(cb, "sql_review_start", stepId=sid,
+                            text="正在审查 SQL 是否符合业务问题...")
+
+                sql_review_result = await review_sql(
+                    question=question,
+                    plan=plan,
+                    step=step,
+                    sql=step_sql,
+                    used_tables=sql_result.get("usedTables", []),
+                    metric_definitions=metric_section,
+                    relation_context=relation_section,
+                    schema_context=schema_context,
+                    business_rules=rules_text,
+                )
+
+                if sql_review_result.get("passed"):
+                    await _emit(cb, "sql_review_done", stepId=sid,
+                                passed=True,
+                                riskLevel=sql_review_result.get("riskLevel", "low"),
+                                issues=sql_review_result.get("issues", []),
+                                suggestions=sql_review_result.get("suggestions", []))
+                    break
+
+                # Review failed
+                await _emit(cb, "sql_review_failed", stepId=sid,
+                            issues=sql_review_result.get("issues", []),
+                            suggestions=sql_review_result.get("suggestions", []),
+                            text="SQL 语义审查未通过，正在重新生成 SQL...")
+
+                retries_left -= 1
+                if retries_left < 0:
+                    break
+
+                # Retry SQL build with review feedback
+                sql_result = await build_step_sql(
+                    question, plan, step, observations,
+                    conversation_context,
+                    review_feedback=sql_review_result,
+                )
+                step_sql = sql_result.get("sql")
+                bind_params = sql_result.get("params") or {}
+                step_sql = enforce_del_flag(step_sql)
+
+                await _emit(cb, "sql_generated", stepId=sid,
+                            sql=step_sql, usedTables=sql_result.get("usedTables", []),
+                            reason=sql_result.get("reason", ""),
+                            riskLevel=sql_result.get("riskLevel", "low"))
+
+                if not sql_result.get("canGenerate") or not step_sql:
+                    sql_review_result = {
+                        "passed": False, "riskLevel": "high",
+                        "issues": ["重试后 SQL Builder 仍然无法生成有效 SQL"],
+                        "suggestions": [],
+                        "reason": sql_result.get("reason", "SQL Builder 返回 canGenerate=false"),
+                    }
+                    break
+
+            # If review still failed after retries, mark step as failed
+            if sql_review_result and not sql_review_result.get("passed"):
+                await _emit(cb, "step_error", stepId=sid, errorCode="SQL_REVIEW_FAILED",
+                            errorMsg=sql_review_result.get("reason", ""))
+                step_logs.append(dict(
+                    stepId=sid, name=step.get("name", ""), purpose=step.get("purpose", ""),
+                    success=False, errorCode="SQL_REVIEW_FAILED",
+                    errorMsg=sql_review_result.get("reason", ""),
+                    sql=step_sql, rowCount=0, rowsPreview=[],
+                    usedTables=sql_result.get("usedTables", []),
+                    riskLevel=sql_review_result.get("riskLevel", "high"),
+                    durationMs=int((time.time() - step_t0) * 1000),
+                    sql_review=sql_review_result,
+                ))
+                continue
 
         # Safety check
         try:
@@ -322,6 +426,7 @@ async def run_data_agent(
             usedTables=sql_result.get("usedTables", []),
             riskLevel=sql_result.get("riskLevel", "low"),
             durationMs=step_duration,
+            sql_review=sql_review_result,
         ))
 
     # Success state

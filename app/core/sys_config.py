@@ -16,6 +16,8 @@ _DEFAULTS = {
     "free_sql.max_estimated_rows": 50000,
     "sql.timeout_seconds": 10,
     "sql.show_sql_default": True,
+    "sql_review.enabled": True,
+    "sql_review.max_retry": 1,
 }
 
 _BOOL_KEYS = {
@@ -23,12 +25,14 @@ _BOOL_KEYS = {
     "agent.allow_followup_steps",
     "free_sql.enabled", "free_sql.require_confirm",
     "free_sql.explain_before_run", "sql.show_sql_default",
+    "sql_review.enabled",
 }
 
 _INT_KEYS = {
     "agent.max_steps", "agent.default_limit",
     "free_sql.max_rows", "free_sql.max_estimated_rows",
     "sql.timeout_seconds",
+    "sql_review.max_retry",
 }
 
 

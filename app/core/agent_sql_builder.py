@@ -117,6 +117,7 @@ SQL_BUILDER_PROMPT = """
   "riskLevel": "high"
 }}
 
+{review_feedback}
 请返回 JSON：
 """
 
@@ -154,6 +155,7 @@ async def build_step_sql(
     step: dict,
     previous_observations: list[dict],
     conversation_context: list[dict] | None = None,
+    review_feedback: dict | None = None,
 ) -> dict:
     schema_text = _build_schema_text()
     rules = load_business_rules()
@@ -199,6 +201,25 @@ async def build_step_sql(
         if ctx_parts:
             ctx_text = "最近对话:\n" + "\n".join(ctx_parts)
 
+    # Build review feedback text
+    review_text = ""
+    if review_feedback:
+        issues = review_feedback.get("issues", [])
+        suggestions = review_feedback.get("suggestions", [])
+        issues_str = "\n".join(f"  - {i}" for i in issues) if issues else "  无"
+        suggestions_str = "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  无"
+        review_text = f"""
+=== 上一次 SQL 审查未通过 ===
+
+问题：
+{issues_str}
+
+建议：
+{suggestions_str}
+
+请根据审查意见重新生成 SQL。必须修复上述问题，不要重复生成同样错误的 SQL。
+"""
+
     prompt = SQL_BUILDER_PROMPT.format(
         current_date=current_date,
         table_schemas=schema_text,
@@ -212,6 +233,7 @@ async def build_step_sql(
         plan_json=json.dumps(plan, ensure_ascii=False, indent=2),
         step_json=json.dumps(step, ensure_ascii=False, indent=2),
         previous_summary=prev_summary,
+        review_feedback=review_text,
     )
 
     client = create_llm_client()
