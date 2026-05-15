@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
 
 
@@ -38,7 +39,8 @@ class Settings(BaseSettings):
             f"?charset={self.MYSQL_CHARSET}"
         )
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    _env_file = Path(__file__).resolve().parent.parent / ".env"
+    model_config = {"env_file": str(_env_file), "env_file_encoding": "utf-8"}
 
 
 settings = Settings()

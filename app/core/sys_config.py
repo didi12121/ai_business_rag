@@ -1,6 +1,9 @@
+import time
 from app.database import SessionLocal
 
 _cache: dict | None = None
+_cache_ts: float = 0
+CACHE_TTL: float = 30  # seconds, auto-pick up config changes without restart
 
 _DEFAULTS = {
     "agent.enabled": True,
@@ -86,9 +89,10 @@ def load_sys_config(prefix: str = "ai.") -> dict:
 
 
 def get_ai_config() -> dict:
-    global _cache
-    if _cache is None:
+    global _cache, _cache_ts
+    if _cache is None or (time.time() - _cache_ts > CACHE_TTL):
         _cache = load_sys_config("ai.")
+        _cache_ts = time.time()
         for k, v in _DEFAULTS.items():
             if k not in _cache:
                 _cache[k] = v
@@ -96,8 +100,9 @@ def get_ai_config() -> dict:
 
 
 def refresh_ai_config_cache() -> dict:
-    global _cache
+    global _cache, _cache_ts
     _cache = load_sys_config("ai.")
+    _cache_ts = time.time()
     for k, v in _DEFAULTS.items():
         if k not in _cache:
             _cache[k] = v

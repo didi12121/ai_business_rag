@@ -51,12 +51,33 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC"
 .input-inner button { width: 40px; height: 40px; border: none; border-radius: 12px; background: var(--primary); color: #fff; cursor: pointer; font-size: 18px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
 .input-inner button:hover { background: #4338ca; }
 .input-inner button:disabled { opacity: 0.5; cursor: not-allowed; }
+.model-select { font-size: 11px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; max-width: 160px; outline: none; }
+.model-select:focus { border-color: var(--primary); }
+.model-select option[data-action] { color: var(--primary); font-weight: 600; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; animation: fadeIn .2s ease; }
+.modal-dialog { background: var(--surface); border-radius: var(--radius); box-shadow: 0 8px 32px rgba(0,0,0,0.15); padding: 24px; max-width: 440px; width: 90%; }
+.modal-dialog h3 { font-size: 16px; margin-bottom: 16px; }
+.form-group { margin-bottom: 12px; }
+.form-group label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+.form-input { width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; outline: none; font-family: inherit; }
+.form-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(79,70,229,0.1); }
+.form-row { display: flex; gap: 8px; }
+.form-row .form-group { flex: 1; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.btn { padding: 7px 16px; border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid transparent; font-family: inherit; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: #4338ca; }
+.btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border); }
+.btn-secondary:hover { background: var(--bg); }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-danger:hover { background: #dc2626; }
 </style>
 </head>
 <body>
 <div class="header">
   <div class="logo">AI</div>
   <div style="flex:1"><h1 style="font-size:16px;font-weight:600;">业务 AI 助手</h1><p style="font-size:11px;color:var(--text-secondary);">产品 · 厂家 · 出货 · 原料 · 库存</p></div>
+  <select id="modelSelect" class="model-select"></select>
   <span id="sessionBadge" style="font-size:10px;color:var(--text-secondary);background:var(--bg);padding:4px 8px;border-radius:10px;display:none;"></span>
   <button id="clearCtxBtn" style="font-size:10px;padding:4px 8px;border:1px solid var(--border);border-radius:8px;background:var(--surface);cursor:pointer;display:none;">清空上下文</button>
 </div>
@@ -172,6 +193,11 @@ async function ask(question) {
     switch (data.event) {
       case 'session':
         sessionId = data.sessionId; sessionBadge.textContent = '会话: ' + sessionId.slice(0, 8); sessionBadge.style.display = ''; clearCtxBtn.style.display = ''; break;
+      case 'route_decided':
+        var modeLabels = {template:'📋 模板匹配', free_sql:'🔓 自由SQL', agent:'🤖 多步Agent', rule:'📖 规则解释', reject:'🚫 已拒绝'};
+        var label = modeLabels[data.mode] || data.mode;
+        addStep('route', '🔀', '路由: ' + label + ' (' + (data.reason||'') + ')', 'done');
+        meta.routeMode = data.mode; break;
       case 'thinking': addStep(data.step || 'agent', '⏳', data.text, 'running'); break;
       case 'planning_start': addStep('plan', '🧠', data.text, 'running'); break;
       case 'plan_ready':
@@ -212,6 +238,117 @@ clearCtxBtn.addEventListener('click', function() {
   sessionBadge.style.display = 'none'; clearCtxBtn.style.display = 'none'; sessionId = null; addUserMsg('[已清空上下文]');
 });
 document.querySelectorAll('.quick-asks button').forEach(function(btn) { btn.addEventListener('click', function() { if (sendBtn.disabled) return; var q = btn.dataset.q; addUserMsg(q); ask(q); }); });
+
+// ── Model management ──
+const modelSelect = document.getElementById('modelSelect');
+let modelList = [];
+
+function loadModels() {
+  fetch('/api/ai/models').then(function(r) { return r.json(); }).then(function(data) {
+    if (!data.success) return;
+    modelList = data.models || [];
+    renderModelOptions();
+  });
+}
+
+function renderModelOptions() {
+  modelSelect.innerHTML = '';
+  if (modelList.length === 0) { modelSelect.style.display = 'none'; return; }
+  modelSelect.style.display = '';
+  for (var i = 0; i < modelList.length; i++) {
+    var m = modelList[i];
+    var opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.name + (m.is_active ? ' ✓' : '');
+    modelSelect.appendChild(opt);
+  }
+  var addOpt = document.createElement('option');
+  addOpt.value = '__add__';
+  addOpt.textContent = '＋ 添加新模型';
+  addOpt.setAttribute('data-action', 'add');
+  modelSelect.appendChild(addOpt);
+  // select active model
+  for (var j = 0; j < modelList.length; j++) {
+    if (modelList[j].is_active) { modelSelect.value = modelList[j].id; break; }
+  }
+}
+
+modelSelect.addEventListener('change', function() {
+  var val = modelSelect.value;
+  if (val === '__add__') { showModelDialog(null); return; }
+  if (!val) return;
+  switchModel(parseInt(val));
+});
+
+function showModelDialog(m) {
+  var title = m ? '编辑模型' : '添加新模型';
+  var overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML =
+    '<div class="modal-dialog">' +
+    '<h3>' + title + '</h3>' +
+    '<div class="form-group"><label>显示名称</label><input class="form-input" id="mfName" value="' + (m ? escAttr(m.name) : '') + '" placeholder="如 DeepSeek V3"></div>' +
+    '<div class="form-group"><label>API 地址</label><input class="form-input" id="mfUrl" value="' + (m ? escAttr(m.base_url) : '') + '" placeholder="https://api.deepseek.com"></div>' +
+    '<div class="form-group"><label>API Key</label><input class="form-input" id="mfKey" value="' + (m ? escAttr(m.api_key) : '') + '" placeholder="sk-xxx"></div>' +
+    '<div class="form-row">' +
+    '<div class="form-group"><label>模型标识</label><input class="form-input" id="mfModel" value="' + (m ? escAttr(m.model) : '') + '" placeholder="deepseek-chat"></div>' +
+    '<div class="form-group"><label>超时(秒)</label><input class="form-input" id="mfTimeout" type="number" value="' + (m ? m.timeout : 120) + '"></div>' +
+    '</div>' +
+    '<div class="modal-actions">' +
+    (m ? '<button class="btn btn-danger" id="mfDelete">删除</button>' : '') +
+    '<button class="btn btn-secondary" id="mfCancel">取消</button>' +
+    '<button class="btn btn-primary" id="mfSave">保存</button>' +
+    '</div></div>';
+  document.body.appendChild(overlay);
+
+  document.getElementById('mfCancel').addEventListener('click', function() { overlay.remove(); });
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+
+  document.getElementById('mfSave').addEventListener('click', function() {
+    var body = {
+      name: document.getElementById('mfName').value.trim(),
+      base_url: document.getElementById('mfUrl').value.trim(),
+      api_key: document.getElementById('mfKey').value.trim(),
+      model: document.getElementById('mfModel').value.trim(),
+      timeout: parseInt(document.getElementById('mfTimeout').value) || 120,
+      sort_order: m ? m.sort_order : 0
+    };
+    if (!body.name || !body.base_url) { alert('名称和 API 地址必填'); return; }
+    var method = m ? 'PUT' : 'POST';
+    var url = m ? '/api/ai/models/' + m.id : '/api/ai/models';
+    fetch(url, { method: method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success) { overlay.remove(); loadModels(); }
+        else { alert(d.errorMsg || '保存失败'); }
+      });
+  });
+
+  if (m) {
+    document.getElementById('mfDelete').addEventListener('click', function() {
+      if (!confirm('确定删除模型 "' + m.name + '" 吗？')) return;
+      fetch('/api/ai/models/' + m.id, { method: 'DELETE' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.success) { overlay.remove(); loadModels(); }
+          else { alert(d.errorMsg || '删除失败'); }
+        });
+    });
+  }
+}
+
+function escAttr(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function switchModel(id) {
+  fetch('/api/ai/models/' + id + '/activate', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d.success) { alert(d.errorMsg || '切换失败'); loadModels(); return; }
+      loadModels();
+    });
+}
+
+loadModels();
 </script>
 </body>
 </html>
