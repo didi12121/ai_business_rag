@@ -71,11 +71,18 @@ SQL_BUILDER_PROMPT = """
 12. "哪个厂家"不是厂家名，不能生成 factory_name LIKE '%哪个厂家%'。
 13. "哪个原料"不是原料名，不能生成 raw_name LIKE '%哪个原料%'。
 14. "出货金额最高"表示按金额汇总排序，不是筛选条件。
-15. shipment_amount 用 (quantity * unit_price) 或 total_price 或 sum(weight * unit_price)。
-16. shipment_weight 用 weight 字段。
-17. shipment_quantity 用 kuang_num 或 num 或 quantity 字段。
-18. 不要编造不存在的字段，不确定就 canGenerate=false。
-19. 返回严格 JSON，不要 Markdown。
+15. 查看 step.metric，从"业务指标定义"中找到对应的 metric_code：
+    - metric=shipment_amount → 使用 shipment_amount 的 aggregate_expression（聚合查询）或 sql_expression（明细查询）
+    - metric=record_amount → 使用 record_amount 的 aggregate_expression 或 sql_expression
+    - 不要自创指标公式，必须使用 ai_metric_definition 中定义的表达式
+16. 不要混用两种金额公式：
+    - 出货金额（shipment_amount）用重量折算公式，必须包含 CASE WHEN is_kg
+    - 普通金额（record_amount）用数量 × 单价
+17. shipment_weight 用 weight 字段。
+18. shipment_quantity 用 kuang_num 或 num 或 quantity 字段。
+19. 如果 step.metric 在业务指标定义中找不到对应公式 → canGenerate=false，reason 说明缺少哪个指标定义。
+20. 不要编造不存在的字段，不确定就 canGenerate=false。
+21. 返回严格 JSON，不要 Markdown。
 
 === 实体消歧规则 ===
 
@@ -91,6 +98,8 @@ SQL_BUILDER_PROMPT = """
 
 === 反例（禁止） ===
 - ORDER BY total_weight DESC 用于"出货金额最高" → 错误，应按 amount 排序
+- metric=shipment_amount 但使用了 kuang_num * unit_price → 错误，出货金额用重量折算公式
+- metric=record_amount 但使用了 weight * CASE WHEN is_kg 公式 → 错误，普通金额用数量×单价
 - SUM(apr.total_price) AS total_amount → 错误，total_price 不存在
 - api.unit_price AS total_amount → 错误，单价不是金额
 - api.ad_product_name LIKE '%哪个产品%' → 错误，疑问词不是产品名

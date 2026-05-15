@@ -41,7 +41,14 @@ PLANNER_PROMPT = """
 8. "哪个原料"不是原料名 → targetEntity=raw_material。
 9. "最高/最大/排行/前几" → ranking + desc。
 10. "最低/最少" → ranking + asc。
-11. "金额/销售额/总价" → metric=shipment_amount。
+11. metric 金额区分规则（重要）：
+    a) 用户明确说以下词语 → metric=shipment_amount（出货折算金额）：
+       "出货金额"、"出库金额"、"出货折算金额"、"哪个产品出货金额最高"、"出货金额排行榜"
+    b) 用户明确说以下词语 → metric=record_amount（普通记录金额）：
+       "订单金额"、"明细金额"、"数量乘单价"、"数量×单价"、"普通金额"
+    c) 用户只说"金额"但上下文是产品出货/出库统计 → 默认 metric=shipment_amount
+    d) 用户只说"金额"但上下文是订单/明细 → 默认 metric=record_amount
+    e) 无法判断金额口径 → 默认 shipment_amount，在 plan.reason 中注明"用户未明确金额口径，系统按出货折算金额口径处理"
 12. "重量/斤/KG/公斤" → metric=shipment_weight。
 13. "数量/框数/筐数/件数" → metric=shipment_quantity。
 14. "出货金额/出货量" → 从 ad_product_record 汇总。
@@ -94,7 +101,7 @@ PLANNER_PROMPT = """
       "dataNeeded": "需要什么数据",
       "queryType": "ranking | aggregate | detail | list | compare | trend",
       "targetEntity": "product | factory | raw_material | order | record",
-      "metric": "shipment_amount | shipment_weight | shipment_quantity | record_count | inventory | unknown",
+      "metric": "shipment_amount | record_amount | shipment_weight | shipment_quantity | inventory | record_count | unknown",
       "timeRange": {{"start": "yyyy-MM-dd HH:mm:ss", "end": "yyyy-MM-dd HH:mm:ss", "label": "上个月"}},
       "filters": [],
       "groupBy": ["product"],

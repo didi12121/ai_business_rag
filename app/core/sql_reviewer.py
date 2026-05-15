@@ -71,12 +71,25 @@ REVIEWER_PROMPT = """
 - 是否把"出货金额最高"误当成筛选条件（应是排序条件）？
 - 是否把原料名误当成产品名过滤？
 
-**5. 指标公式是否正确**
-- 如果 step.metric = shipment_amount → SQL 是否使用了出货金额指标公式？
-- 出货金额公式是否包含 CASE WHEN afi.is_kg = 1 THEN 1000 ELSE 500 END 逻辑？
-- 是否错误使用 total_price、unit_price、total_weight 代替出货金额？
-- 用户问"金额最高" → 是否按金额排序，而不是按重量（weight）排序？
-- 聚合表达式中的 NULLIF 是否保留？
+**5. 指标公式是否正确（关键：按 step.metric 区分金额口径）**
+
+先查看 step.metric 的值，判断应该使用哪种金额公式：
+
+- metric = shipment_amount → 检查 SQL 是否使用出货折算金额公式：
+  必须包含 CASE WHEN afi.is_kg = 1 THEN 1000 ELSE 500 END
+  使用 apr.weight、api.weight、api.unit_price 等字段。
+  NULLIF(api.weight, 0) 必须保留。
+  不要误判为"为什么不用数量×单价" —— 出货金额本来就用重量折算。
+
+- metric = record_amount → 检查 SQL 是否使用普通记录金额公式：
+  应使用数量字段 × 单价（如 kuang_num * unit_price）。
+  不要误判为"为什么不用重量折算公式" —— 普通金额本来就用数量×单价。
+
+- 不要把 record_amount 的"数量 × 单价"误判为金额公式错误。
+- 不要把 shipment_amount 的"重量折算金额"误判为金额公式错误。
+- 如果 SQL 使用的金额公式和 step.metric 不匹配 → review failed，明确指出两种口径的区别。
+- 如果 step.metric 不是金额类指标（如 shipment_weight、shipment_quantity、inventory），则跳过此项检查。
+- 用户问"金额最高" → 是否按金额排序，而不是按重量排序？
 
 **6. 排序和 LIMIT 是否正确**
 - 用户问最高/最多 → ORDER BY ... DESC？

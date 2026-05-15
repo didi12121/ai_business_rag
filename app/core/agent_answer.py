@@ -41,9 +41,12 @@ partialSuccess: {partial_success}
 - 如果数据不足或无法分析，请说明。
 
 【统计口径】
-- 时间范围：xxx 至 xxx。
-- 指标口径：出货金额按业务规则计算（出库重量 x 单位换算系数 / 产品单重 x 产品单价。is_kg=1时系数1000，否则500）。
-- 如果用户没有问计算公式且不是金额相关，可以简化为"出货金额按业务规则计算"。
+- 时间范围：根据查询步骤中的时间条件说明。
+- 涉及 shipment_amount（出货折算金额）：说明口径为"出货折算金额按业务规则计算：出库重量 × 单位换算系数 ÷ 产品单重 × 产品单价。is_kg=1时系数为1000，否则为500。"
+- 涉及 record_amount（普通记录金额）：说明口径为"金额按数量 × 单价计算。"
+- 涉及其他指标（重量、数量等）：简要说明计算方式。
+- 不要同时出现两种金额口径的说明，只说明实际使用的口径。
+- 如果用户没有问计算公式且不是金额相关，可以简化为"按业务规则计算"。
 
 === 严格规则 ===
 
@@ -73,10 +76,18 @@ async def generate_final_answer(
 ) -> str:
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Compact plan summary
+    # Compact plan summary with metric info
     plan_summary = ""
     if plan:
         plan_summary = f"目标: {plan.get('goal', '')}, 任务类型: {plan.get('taskType', '')}"
+        # Collect metrics used in each step for caliber guidance
+        metrics_used = []
+        for step in plan.get("steps", []):
+            m = step.get("metric", "")
+            if m and m not in ("unknown", "record_count") and m not in metrics_used:
+                metrics_used.append(m)
+        if metrics_used:
+            plan_summary += f", 使用的指标: {', '.join(metrics_used)}"
 
     failed_summary = []
     if failed_steps:
