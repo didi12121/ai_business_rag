@@ -8,7 +8,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.database import SessionLocal
 from app.llm.openai_compatible import create_llm_client
 from app.core.sys_config import get_ai_config
-from app.core.sql_safety import check_sql_safety, build_display_sql, is_modification_request
+from app.core.sql_safety import check_sql_safety, build_display_sql
+from app.core.query_router import route_question
 from app.core.intent_parser import parse_intent
 from app.core.quick_intent import quick_intent_match
 from app.core.business_context import (
@@ -66,21 +67,32 @@ async def ws_chat(ws: WebSocket):
             session_id = new_session_id()
             await _send(ws, "session", {"sessionId": session_id})
 
-        # Reject modification requests
-        if is_modification_request(question):
+        # ── Load context and route ──
+        from app.core.conversation_memory import get_context
+        ctx = get_context(session_id, max_turns=5)
+        route = route_question(question, ctx)
+        route_mode = route["mode"]
+
+        await _send(ws, "route_decided", {
+            "mode": route_mode,
+            "reason": route["reason"],
+            "confidence": route.get("confidence", 0),
+        })
+
+        # ── reject ──
+        if route_mode == "reject":
             await _send(ws, "error", {"message": "当前 AI 模块只支持查询和分析，不支持修改业务数据。"})
             await ws.close()
             return
 
-        # Agent mode (priority)
-        agent_failed = False
-        if config.get("agent.enabled", True):
-            from app.core.conversation_memory import get_context
+        # ── agent ──
+        if route_mode == "agent":
+            if not config.get("agent.enabled", True):
+                await _send(ws, "error", {"message": "复杂分析功能未启用"})
+                await ws.close()
+                return
+
             from app.core.data_agent import run_data_agent
-
-            ctx = get_context(session_id, max_turns=5)
-
-            # Track if done was already emitted by data_agent
             agent_done_emitted = False
 
             async def event_cb_agent(payload: dict):
@@ -93,52 +105,26 @@ async def ws_chat(ws: WebSocket):
                     pass
 
             result = await run_data_agent(
-                question=question,
-                session_id=session_id,
-                user_id=None,
-                show_sql=show_sql,
-                event_callback=event_cb_agent,
+                question=question, session_id=session_id, user_id=None,
+                show_sql=show_sql, event_callback=event_cb_agent,
                 conversation_context=ctx,
             )
 
             if result.get("success"):
                 if not agent_done_emitted:
                     await _send(ws, "done", result)
-                await ws.close()
-                return
             elif result.get("errorCode") == "REJECTED":
-                await ws.close()
-                return
+                pass
             else:
-                # Agent failed — fallback
-                agent_failed = True
-                await _send(ws, "fallback_start", {
-                    "reason": result.get("errorMsg", "Agent 无法回答"),
-                    "errorCode": result.get("errorCode", "AGENT_ERROR"),
+                await _send(ws, "error", {
+                    "message": result.get("answer", "Agent 分析未能完成"),
+                    "errorCode": result.get("errorCode"),
                 })
+            await ws.close()
+            return
 
-        if not agent_failed:
-            pass  # Agent not enabled or not attempted
-
-        # 1. Intent
-        await _send(ws, "thinking", {"step": "intent", "text": "正在识别查询意图..."})
-        intent_result = quick_intent_match(question)
-        intent_source = "local" if intent_result else None
-        if not intent_result:
-            intent_result = await parse_intent(question)
-            intent_source = "llm"
-
-        intent_code = intent_result.get("intent", "unknown")
-        confidence = intent_result.get("confidence", 0)
-
-        await _send(ws, "intent_done", {
-            "intent": intent_code, "confidence": confidence,
-            "reason": intent_result.get("reason", ""),
-            "params": intent_result.get("params", {}), "source": intent_source,
-        })
-
-        # 2. Rule explain
-        if intent_code == "business_rule_explain":
+        # ── rule (explain directly, no SQL) ──
+        if route_mode == "rule":
             table_schemas = load_table_schemas()
             field_schemas = load_field_schemas()
             rules = load_business_rules()
@@ -158,82 +144,85 @@ async def ws_chat(ws: WebSocket):
             await ws.close()
             return
 
-        # 3. Template query
-        if intent_code != "unknown" and confidence >= 0.45:
-            template = load_query_template(intent_code)
-            if not template:
-                await _send(ws, "error", {"message": "没有找到对应查询模板"})
-                await ws.close()
-                return
+        # ── template ──
+        if route_mode == "template":
+            await _send(ws, "thinking", {"step": "intent", "text": "正在识别查询意图..."})
+            intent_result = quick_intent_match(question)
+            if not intent_result:
+                intent_result = await parse_intent(question)
 
-            params = resolve_relative_date_params(intent_result.get("params", {}), question)
-            sql, bind_params = render_sql_template(template["sql_template"], params)
+            intent_code = intent_result.get("intent", "unknown")
+            confidence = intent_result.get("confidence", 0)
 
-            await _send(ws, "sql_ready", {
-                "sql": build_display_sql(sql, bind_params),
-                "template": template["template_name"],
+            await _send(ws, "intent_done", {
+                "intent": intent_code, "confidence": confidence,
+                "reason": intent_result.get("reason", ""),
+                "params": intent_result.get("params", {}),
             })
 
-            # Safety
-            await _send(ws, "thinking", {"step": "safety", "text": "正在安全检查..."})
-            try:
-                from sqlalchemy import text as sa_text
-                sql = check_sql_safety(sql, max_rows=config.get("free_sql.max_rows", 200))  # template path
-            except Exception as e:
-                await _send(ws, "error", {"message": f"SQL 安全检查失败: {e}"})
-                await ws.close()
-                return
+            if intent_code != "unknown" and confidence >= 0.45:
+                template = load_query_template(intent_code)
+                if template:
+                    params = resolve_relative_date_params(intent_result.get("params", {}), question)
+                    sql, bind_params = render_sql_template(template["sql_template"], params)
+                    await _send(ws, "sql_ready", {
+                        "sql": build_display_sql(sql, bind_params),
+                        "template": template["template_name"],
+                    })
+                    await _send(ws, "thinking", {"step": "safety", "text": "正在安全检查..."})
+                    try:
+                        from sqlalchemy import text as sa_text
+                        sql = check_sql_safety(sql, max_rows=config.get("free_sql.max_rows", 200))
+                    except Exception as e:
+                        await _send(ws, "error", {"message": f"SQL 安全检查失败: {e}"})
+                        await ws.close()
+                        return
+                    await _send(ws, "thinking", {"step": "query", "text": "正在查询数据库..."})
+                    db = SessionLocal()
+                    try:
+                        db.execute(sa_text("SET SESSION max_execution_time = :t"),
+                                   {"t": config.get("sql.timeout_seconds", 10) * 1000})
+                        result = db.execute(sa_text(sql), bind_params)
+                        rows_raw = result.fetchall()
+                        columns = list(result.keys())
+                        rows = [dict(zip(columns, r)) for r in rows_raw]
+                    except Exception as e:
+                        await _send(ws, "error", {"message": f"SQL 执行失败: {e}"})
+                        await ws.close()
+                        db.close()
+                        return
+                    finally:
+                        db.close()
+                    await _send(ws, "query_done", {
+                        "rowCount": len(rows),
+                        "rows": [{k: _normalize_value(v) for k, v in r.items()} for r in rows],
+                    })
+                    rules = load_business_rules()
+                    prompt = ANSWER_PROMPT.format(
+                        current_date=datetime.now().strftime("%Y-%m-%d"),
+                        question=question, intent=intent_code,
+                        template_description=template.get("description", ""),
+                        business_rules=_to_json(rules),
+                        sql_result_json=_to_json(rows[:50]),
+                        result_description=template.get("result_description", ""),
+                    )
+                    client = create_llm_client()
+                    await _send(ws, "answer_start")
+                    async for token in client.chat_stream([{"role": "system", "content": prompt}]):
+                        await _send(ws, "answer_chunk", {"text": token})
+                    duration_ms = int((time.time() - t0) * 1000)
+                    await _send(ws, "done", {"durationMs": duration_ms, "queryMode": "template"})
+                    await ws.close()
+                    return
+            # Template match failed → fall through to free_sql below
 
-            # Execute
-            await _send(ws, "thinking", {"step": "query", "text": "正在查询数据库..."})
-            db = SessionLocal()
-            try:
-                db.execute(sa_text("SET SESSION max_execution_time = :t"),
-                           {"t": config.get("sql.timeout_seconds", 10) * 1000})
-                result = db.execute(sa_text(sql), bind_params)
-                rows_raw = result.fetchall()
-                columns = list(result.keys())
-                rows = [dict(zip(columns, r)) for r in rows_raw]
-            except Exception as e:
-                await _send(ws, "error", {"message": f"SQL 执行失败: {e}"})
-                await ws.close()
-                db.close()
-                return
-            finally:
-                db.close()
-
-            await _send(ws, "query_done", {
-                "rowCount": len(rows),
-                "rows": [{k: _normalize_value(v) for k, v in r.items()} for r in rows],
-            })
-
-            # Answer
-            rules = load_business_rules()
-            prompt = ANSWER_PROMPT.format(
-                current_date=datetime.now().strftime("%Y-%m-%d"),
-                question=question, intent=intent_code,
-                template_description=template.get("description", ""),
-                business_rules=_to_json(rules),
-                sql_result_json=_to_json(rows[:50]),
-                result_description=template.get("result_description", ""),
-            )
-            client = create_llm_client()
-            await _send(ws, "answer_start")
-            async for token in client.chat_stream([{"role": "system", "content": prompt}]):
-                await _send(ws, "answer_chunk", {"text": token})
-
-            duration_ms = int((time.time() - t0) * 1000)
-            await _send(ws, "done", {"durationMs": duration_ms, "queryMode": "template"})
-            await ws.close()
-            return
-
-        # 4. Free SQL
+        # ── free_sql (also serves as fallback for template) ──
         if not config.get("free_sql.enabled", False):
-            await _send(ws, "error", {"message": "当前问题暂时无法识别且自由SQL未启用。你可以尝试询问：某厂家有哪些产品、某产品单价、本月出货等问题。"})
+            await _send(ws, "error", {"message": "当前问题暂时无法识别且自由SQL未启用。"})
             await ws.close()
             return
 
-        await _send(ws, "thinking", {"step": "free_sql", "text": "未匹配到固定模板，AI 正在根据表结构生成查询..."})
+        await _send(ws, "thinking", {"step": "free_sql", "text": "AI 正在根据表结构生成查询..."})
 
         free_result = await generate_free_sql(question)
         await _send(ws, "free_sql_reason", {
@@ -257,7 +246,6 @@ async def ws_chat(ws: WebSocket):
             "template": "自由 SQL 查询",
         })
 
-        # Safety
         await _send(ws, "thinking", {"step": "safety", "text": "正在安全检查..."})
         try:
             sql = check_sql_safety(sql, max_rows=config.get("free_sql.max_rows", 200), is_free_sql=True)
@@ -266,7 +254,6 @@ async def ws_chat(ws: WebSocket):
             await ws.close()
             return
 
-        # EXPLAIN
         estimated_rows = None
         if config.get("free_sql.explain_before_run", True):
             await _send(ws, "thinking", {"step": "explain", "text": "正在预估查询范围..."})
@@ -295,7 +282,6 @@ async def ws_chat(ws: WebSocket):
             finally:
                 db.close()
 
-        # Execute
         await _send(ws, "thinking", {"step": "query", "text": "正在查询数据库..."})
         db = SessionLocal()
         try:
@@ -320,7 +306,6 @@ async def ws_chat(ws: WebSocket):
             "estimatedRows": estimated_rows,
         })
 
-        # Answer
         rules = load_business_rules()
         prompt = ANSWER_PROMPT.format(
             current_date=datetime.now().strftime("%Y-%m-%d"),

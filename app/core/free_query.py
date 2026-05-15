@@ -31,14 +31,6 @@ FREE_SQL_PROMPT = """
 
 {metric_definitions}
 
-=== 表关系说明 ===
-- ad_factory_info.factory_info_id → ad_product_info.ad_factory_info_id → ad_product_parts.ad_factory_info_id
-- ad_product_info.ad_product_info_id → ad_product_parts.ad_product_info_id → ad_order_item.ad_product_info_id
-- ad_order_info.ad_order_id → ad_order_item.ad_order_id
-- ad_product_record.product_info_id → ad_product_info.ad_product_info_id
-- ad_product_record.factory_info_id → ad_factory_info.factory_info_id
-- ad_raw_record.factory_info_id → ad_factory_info.factory_info_id
-
 === 业务规则 ===
 {business_rules}
 

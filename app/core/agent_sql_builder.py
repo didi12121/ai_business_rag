@@ -60,6 +60,7 @@ SQL_BUILDER_PROMPT = """
 7. 有 del_flag 的表必须加 del_flag = '0'。
 8. 时间范围使用闭开区间：record_time >= 'xxx' AND record_time < 'xxx'。
 9. **JOIN 规则**：如果推荐JOIN路径存在，必须按推荐路径生成 JOIN。不要自创 JOIN 条件。
+9.5 **baseTable 规则**：Query Plan 指定 baseTable 时，FROM 必须从该表开始。推荐 JOIN 路径中的 baseTable 优先级高于你自己的判断。例如"哪些产品没有出货"类问题，baseTable=ad_product_info，必须从产品表 LEFT JOIN 出库记录表。
 10. **表别名**：必须使用上述别名规范中的别名，不要用 p/t1/t2 等自创别名。
 11. 如果 step 涉及厂家过滤 → 必须 JOIN ad_factory_info。
 12. 如果 step 涉及产品原料/颜色/名称 → 必须 JOIN ad_product_info。
@@ -180,7 +181,8 @@ async def build_step_sql(
     required = list(step.get("requiredTables", []))
     if not required and step.get("metric") == "shipment_amount":
         required = ["ad_product_record", "ad_product_info", "ad_factory_info"]
-    join_info = resolve_join_paths(required) if required else {"canResolve": False, "joins": [], "reason": ""}
+    base_table = step.get("baseTable")
+    join_info = resolve_join_paths(required, base_table=base_table) if required else {"canResolve": False, "joins": [], "reason": ""}
     join_paths_text = ""
     if join_info.get("canResolve"):
         join_paths_text = f"基础表: {join_info['baseTable']}\nJOIN路径:\n"

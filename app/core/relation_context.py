@@ -17,7 +17,7 @@ def load_table_relations() -> list[dict]:
         """)).mappings().all()
         return [dict(r) for r in rows]
     except Exception:
-        logger.warning("Failed to load ai_table_relation")
+        logger.exception("Failed to load ai_table_relation")
         return []
     finally:
         db.close()

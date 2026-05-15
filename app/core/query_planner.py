@@ -80,6 +80,16 @@ PLANNER_PROMPT = """
 32. 如果查询只需单表（如"有哪些厂家"），requiredTables 只写那张表。
 33. 不要包含不存在的表名。
 
+=== baseTable 规则 ===
+34. 每个 step 必须包含 baseTable 字段，指定 FROM 从哪张表开始。
+35. 涉及出货/出库/金额/重量/数量统计 → baseTable = ad_product_record
+36. 查询产品清单 → baseTable = ad_product_info
+37. "哪些产品没有出货"/"最近没出货的产品"等反查 → baseTable = ad_product_info
+    （必须从产品表 LEFT JOIN 出库记录表，不能从出库记录表开始）
+38. 涉及订单明细 → baseTable 选 ad_order_item 或 ad_order_info
+39. 涉及库存 → baseTable = ad_month_inventory
+40. 只查厂家列表 → baseTable = ad_factory_info
+
 === 对话上下文 ===
 
 {conversation_context}
@@ -108,6 +118,7 @@ PLANNER_PROMPT = """
       "sort": [{{"field": "shipment_amount", "direction": "desc"}}],
       "limit": 10,
       "dependsOn": null,
+      "baseTable": "ad_product_record",
       "requiredTables": ["ad_product_record", "ad_product_info", "ad_factory_info"]
     }}
   ],

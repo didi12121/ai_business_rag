@@ -19,7 +19,7 @@ def load_metric_definitions() -> list[dict]:
         """)).mappings().all()
         return [dict(r) for r in rows]
     except Exception:
-        logger.warning("Failed to load ai_metric_definition, metrics unavailable")
+        logger.exception("Failed to load ai_metric_definition, metrics unavailable")
         return []
     finally:
         db.close()
@@ -35,6 +35,7 @@ def build_metric_prompt_section() -> str:
         lines.append(f"指标编码: {m['metric_code']}")
         lines.append(f"指标名称: {m['metric_name']}")
         lines.append(f"说明: {m['description']}")
+        lines.append(f"单行表达式: {m['sql_expression']}")
         lines.append(f"聚合表达式: {m['aggregate_expression']}")
         lines.append(f"需要表: {m['required_tables']}")
         lines.append(f"需要字段: {m['required_fields']}")

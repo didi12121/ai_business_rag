@@ -12,7 +12,7 @@ logger = logging.getLogger("ai_business_rag")
 from app.database import SessionLocal
 from app.models.request import AskRequest
 from app.core.sys_config import get_ai_config, refresh_ai_config_cache
-from app.core.sql_safety import check_sql_safety, build_display_sql, is_modification_request
+from app.core.sql_safety import check_sql_safety, build_display_sql
 from app.core.intent_parser import parse_intent
 from app.core.quick_intent import quick_intent_match
 from app.core.business_context import (
@@ -23,6 +23,7 @@ from app.core.date_resolver import resolve_relative_date_params
 from app.core.sql_renderer import render_sql_template
 from app.core.answer_generator import generate_answer, explain_business_rule
 from app.core.free_query import generate_free_sql
+from app.core.query_router import route_question
 
 router = APIRouter(prefix="/api/ai")
 
@@ -295,117 +296,181 @@ async def ask(req: AskRequest):
     config = get_ai_config()
     show_sql = req.showSql if req.showSql is not None else config.get("sql.show_sql_default", True)
 
-    # Reject modification requests early
-    if is_modification_request(question):
+    # Load conversation context
+    from app.core.conversation_memory import get_context
+    session_id = req.sessionId or "default"
+    ctx = get_context(session_id, max_turns=5)
+
+    # ── Route question ──
+    route = route_question(question, ctx)
+    route_mode = route["mode"]
+    route_reason = route["reason"]
+
+    # ── reject ──
+    if route_mode == "reject":
         duration_ms = _now() - t0
         _save_chat_log(req.sessionId, req.userId, question, "unknown", {},
                        {}, None, [], "当前 AI 模块只支持查询和分析，不支持修改业务数据。",
                        False, "拒绝修改类请求", duration_ms, query_mode="reject")
         return {"success": False, "question": question,
                 "answer": "当前 AI 模块只支持查询和分析，不支持修改业务数据。",
-                "errorCode": "UNSUPPORTED_OPERATION", "errorMsg": "拒绝修改类请求"}
+                "errorCode": "UNSUPPORTED_OPERATION", "errorMsg": "拒绝修改类请求",
+                "routeMode": route_mode, "routeReason": route_reason}
 
-    # Agent mode (priority when enabled)
-    agent_attempted = False
-    if config.get("agent.enabled", True):
-        agent_attempted = True
+    # ── rule ──
+    if route_mode == "rule":
+        intent_result = {"intent": "business_rule_explain", "confidence": 0.95, "params": {}, "reason": route_reason}
+        result = await run_rule_explain(question, intent_result)
+        duration_ms = _now() - t0
+        result["durationMs"] = duration_ms
+        result["routeMode"] = route_mode
+        result["routeReason"] = route_reason
+        _save_chat_log(req.sessionId, req.userId, question, "business_rule_explain", intent_result,
+                       {}, None, result.get("rows", []), result["answer"],
+                       result["success"], "", duration_ms, query_mode="rule")
+        return result
+
+    # ── template ──
+    if route_mode == "template":
+        intent_result = quick_intent_match(question)
+        if not intent_result:
+            intent_result = await parse_intent(question)
+        intent_code = intent_result.get("intent", "unknown")
+        confidence = intent_result.get("confidence", 0)
+
+        if intent_code != "unknown" and confidence >= 0.45:
+            result = await run_template_query(question, intent_code, intent_result, show_sql)
+            duration_ms = _now() - t0
+            result["durationMs"] = duration_ms
+            result["routeMode"] = route_mode
+            result["routeReason"] = route_reason
+            _save_chat_log(req.sessionId, req.userId, question, intent_code, intent_result,
+                           result.get("params", {}), result.get("sql"),
+                           result.get("rows", []), result["answer"],
+                           result["success"], result.get("errorMsg", ""),
+                           duration_ms, query_mode="template")
+            return result
+
+        # Template match failed → fallback to free_sql
+        if not config.get("free_sql.enabled", False):
+            duration_ms = _now() - t0
+            return {"success": False, "question": question,
+                    "answer": "当前问题暂时无法识别。你可以尝试询问：某厂家有哪些产品、某产品单价、本月出货等问题。",
+                    "errorCode": "UNKNOWN_INTENT", "routeMode": route_mode, "routeReason": route_reason}
+        result = await run_free_sql_query(question, show_sql)
+        duration_ms = _now() - t0
+        result["durationMs"] = duration_ms
+        result["routeMode"] = route_mode
+        result["routeReason"] = route_reason
+        _save_chat_log(req.sessionId, req.userId, question,
+                       "free_sql", intent_result, result.get("params", {}), result.get("sql"),
+                       result.get("rows", []), result["answer"],
+                       result["success"], result.get("errorMsg", ""),
+                       duration_ms, query_mode="free_sql",
+                       free_sql_reason=result.get("freeSqlReason"),
+                       used_tables=result.get("usedTables"),
+                       risk_level=result.get("riskLevel"),
+                       estimated_rows=result.get("estimatedRows"))
+        return result
+
+    # ── free_sql ──
+    if route_mode == "free_sql":
+        if not config.get("free_sql.enabled", False):
+            duration_ms = _now() - t0
+            return {"success": False, "question": question,
+                    "answer": "当前问题暂时无法识别。你可以尝试询问常见查询问题。",
+                    "errorCode": "FREE_SQL_DISABLED", "routeMode": route_mode, "routeReason": route_reason}
+
+        result = await run_free_sql_query(question, show_sql)
+        duration_ms = _now() - t0
+        result["durationMs"] = duration_ms
+        result["routeMode"] = route_mode
+        result["routeReason"] = route_reason
+
+        # Fallback to agent if free_sql failed and agent is enabled
+        if not result.get("success") and config.get("agent.enabled", True):
+            logger.info("Free SQL failed, falling back to agent mode: %s", result.get("errorMsg"))
+            try:
+                agent_result = await run_data_agent(
+                    question, session_id, req.userId, show_sql,
+                    conversation_context=ctx,
+                )
+                agent_result["durationMs"] = _now() - t0
+                agent_result["sessionId"] = session_id
+                agent_result["routeMode"] = route_mode
+                agent_result["routeReason"] = route_reason
+                if agent_result.get("success"):
+                    _save_chat_log(req.sessionId, req.userId, question,
+                                   "agent", {}, {}, agent_result.get("sql"),
+                                   agent_result.get("rows", []),
+                                   agent_result["answer"], True, "",
+                                   agent_result["durationMs"], query_mode="agent")
+                    return agent_result
+                elif agent_result.get("errorCode") == "REJECTED":
+                    return agent_result
+            except Exception as e:
+                logger.exception("Agent fallback after free_sql also failed")
+
+        _save_chat_log(req.sessionId, req.userId, question,
+                       "free_sql", {}, result.get("params", {}), result.get("sql"),
+                       result.get("rows", []), result["answer"],
+                       result["success"], result.get("errorMsg", ""),
+                       duration_ms, query_mode="free_sql",
+                       free_sql_reason=result.get("freeSqlReason"),
+                       used_tables=result.get("usedTables"),
+                       risk_level=result.get("riskLevel"),
+                       estimated_rows=result.get("estimatedRows"))
+        return result
+
+    # ── agent ──
+    if route_mode == "agent":
+        if not config.get("agent.enabled", True):
+            duration_ms = _now() - t0
+            return {"success": False, "question": question,
+                    "answer": "复杂分析功能未启用。你可以尝试询问具体产品的查询问题。",
+                    "errorCode": "AGENT_DISABLED", "routeMode": route_mode, "routeReason": route_reason}
+
         try:
-            from app.core.conversation_memory import get_context
             from app.core.data_agent import run_data_agent
-            session_id = req.sessionId or "default"
-            ctx = get_context(session_id, max_turns=5)
             result = await run_data_agent(
                 question, session_id, req.userId, show_sql,
                 conversation_context=ctx,
             )
             result["durationMs"] = _now() - t0
             result["sessionId"] = session_id
+            result["routeMode"] = route_mode
+            result["routeReason"] = route_reason
             if result.get("success"):
-                _save_chat_log(
-                    req.sessionId, req.userId, question,
-                    "agent", {}, {}, result.get("sql"), result.get("rows", []),
-                    result["answer"], True, "", result["durationMs"],
-                    query_mode="agent",
-                )
+                _save_chat_log(req.sessionId, req.userId, question,
+                               "agent", {}, {}, result.get("sql"), result.get("rows", []),
+                               result["answer"], True, "", result["durationMs"],
+                               query_mode="agent")
                 return result
             elif result.get("errorCode") == "REJECTED":
                 return result
-            # Agent failed non-rejection → fall through to template/free_sql
+
+            # Agent failed → no further fallback (Router already decided agent was needed)
+            _save_chat_log(req.sessionId, req.userId, question,
+                           "agent", {}, {}, None, [],
+                           result.get("answer", "Agent 分析未能完成"), False,
+                           result.get("errorMsg", "agent failed"),
+                           result["durationMs"], query_mode="agent")
+            return result
         except Exception as e:
-            logger.exception("Agent failed, fallback to template/free_sql")
-            try:
-                _save_chat_log(
-                    req.sessionId, req.userId, question,
-                    "agent", {}, {}, None, [],
-                    "", False, str(e),
-                    int((time.time() - t0) * 1000),
-                    query_mode="agent",
-                )
-            except Exception:
-                pass
-            # fall through to template/free_sql
+            logger.exception("Agent execution failed")
+            duration_ms = _now() - t0
+            return {"success": False, "question": question,
+                    "answer": "AI 分析暂时不可用，请稍后重试或尝试简单查询。",
+                    "errorCode": "AGENT_ERROR", "errorMsg": str(e),
+                    "routeMode": route_mode, "routeReason": route_reason,
+                    "durationMs": duration_ms}
 
-    # 1. Quick intent match
-    intent_result = quick_intent_match(question)
-    intent_source = "local" if intent_result else None
-
-    # 2. LLM intent if no quick match
-    if not intent_result:
-        intent_result = await parse_intent(question)
-        intent_source = "llm"
-
-    intent_code = intent_result.get("intent", "unknown")
-    confidence = intent_result.get("confidence", 0)
-
-    # 3. Rule explain
-    if intent_code == "business_rule_explain":
-        result = await run_rule_explain(question, intent_result)
-        duration_ms = _now() - t0
-        result["durationMs"] = duration_ms
-        _save_chat_log(req.sessionId, req.userId, question, intent_code, intent_result,
-                       {}, None, result.get("rows", []), result["answer"],
-                       result["success"], "", duration_ms, query_mode="rule")
-        return result
-
-    # 4. Template query
-    if intent_code != "unknown" and confidence >= 0.45:
-        result = await run_template_query(question, intent_code, intent_result, show_sql)
-        duration_ms = _now() - t0
-        result["durationMs"] = duration_ms
-        _save_chat_log(req.sessionId, req.userId, question, intent_code, intent_result,
-                       result.get("params", {}), result.get("sql"),
-                       result.get("rows", []), result["answer"],
-                       result["success"],
-                       result.get("errorMsg", ""),
-                       duration_ms, query_mode="template")
-        return result
-
-    # 5. Free SQL fallback
-    if not config.get("free_sql.enabled", False):
-        duration_ms = _now() - t0
-        _save_chat_log(req.sessionId, req.userId, question, "unknown", intent_result,
-                       {}, None, [],
-                       "当前问题暂时无法识别。你可以尝试询问：某厂家有哪些产品、某产品单价、本月出货、本月原料使用、本月库存等问题。",
-                       False, "FREE_SQL_DISABLED", duration_ms, query_mode="free_sql")
-        return {"success": False, "question": question,
-                "answer": "当前问题暂时无法识别。你可以尝试询问：某厂家有哪些产品、某产品单价、本月出货、本月原料使用、本月库存等问题。",
-                "errorCode": "UNKNOWN_INTENT", "errorMsg": intent_result.get("reason", "")}
-
-    result = await run_free_sql_query(question, show_sql)
+    # ── fallback (should not reach) ──
     duration_ms = _now() - t0
-    result["durationMs"] = duration_ms
-    _save_chat_log(req.sessionId, req.userId, question,
-                   intent_code if intent_code != "unknown" else "free_sql",
-                   intent_result, result.get("params", {}), result.get("sql"),
-                   result.get("rows", []), result["answer"],
-                   result["success"],
-                   result.get("errorMsg", ""),
-                   duration_ms, query_mode="free_sql",
-                   free_sql_reason=result.get("freeSqlReason"),
-                   used_tables=result.get("usedTables"),
-                   risk_level=result.get("riskLevel"),
-                   estimated_rows=result.get("estimatedRows"))
-    return result
+    return {"success": False, "question": question,
+            "answer": "无法处理该问题", "errorCode": "UNKNOWN_ROUTE",
+            "routeMode": route_mode, "routeReason": route_reason,
+            "durationMs": duration_ms}
 
 
 # ── config refresh ───────────────────────────────────────

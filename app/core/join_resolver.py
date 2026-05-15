@@ -2,14 +2,23 @@ from app.core.relation_context import load_table_relations
 from app.core.table_alias import get_table_alias
 
 
-def resolve_join_paths(required_tables: list[str]) -> dict:
-    """Given a list of required tables, find JOIN paths from ai_table_relation."""
+def resolve_join_paths(required_tables: list[str], base_table: str | None = None) -> dict:
+    """Given a list of required tables, find JOIN paths from ai_table_relation.
+
+    If base_table is provided and is in required_tables, use it as the FROM table.
+    If base_table is provided but not in required_tables, add it.
+    If base_table is None, auto-pick the best base table.
+    """
     relations = load_table_relations()
     if not relations or not required_tables:
         return {"canResolve": False, "joins": [], "reason": "无关系数据或未指定表"}
 
     tables = set(required_tables)
-    base = _pick_base_table(tables, relations)
+    if base_table:
+        tables.add(base_table)
+        base = base_table
+    else:
+        base = _pick_base_table(tables, relations)
 
     joins = []
     covered = {base}
