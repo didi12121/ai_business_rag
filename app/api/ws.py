@@ -151,6 +151,29 @@ async def ws_chat(ws: WebSocket):
             if not intent_result:
                 intent_result = await parse_intent(question)
 
+            # ── LLM intent validation (when enabled and regex matched) ──
+            if intent_result and config.get("intent_validator.enabled", True) and intent_result.get("reason") == "本地规则匹配":
+                await _send(ws, "thinking", {"step": "validate", "text": "AI 正在校验意图理解..."})
+                from app.core.intent_validator import validate_intent
+                validation = await validate_intent(
+                    question,
+                    intent_result.get("intent"),
+                    intent_result.get("params", {}),
+                )
+                if not validation.get("valid"):
+                    intent_result = {
+                        "intent": validation.get("intent", intent_result.get("intent")),
+                        "confidence": 0.85,
+                        "params": validation.get("params", intent_result.get("params", {})),
+                        "reason": f"AI校验修正: {validation.get('reason', '')}",
+                    }
+                else:
+                    intent_result["reason"] = f"规则匹配 + AI校验通过"
+                await _send(ws, "validation_done", {
+                    "valid": validation.get("valid", True),
+                    "reason": validation.get("reason", ""),
+                })
+
             intent_code = intent_result.get("intent", "unknown")
             confidence = intent_result.get("confidence", 0)
 

@@ -21,6 +21,7 @@ _DEFAULTS = {
     "sql.show_sql_default": True,
     "sql_review.enabled": True,
     "sql_review.max_retry": 1,
+    "intent_validator.enabled": True,
 }
 
 _BOOL_KEYS = {
@@ -28,7 +29,7 @@ _BOOL_KEYS = {
     "agent.allow_followup_steps",
     "free_sql.enabled", "free_sql.require_confirm",
     "free_sql.explain_before_run", "sql.show_sql_default",
-    "sql_review.enabled",
+    "sql_review.enabled", "intent_validator.enabled",
 }
 
 _INT_KEYS = {

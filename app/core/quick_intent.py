@@ -37,7 +37,19 @@ def quick_intent_match(question: str) -> dict | None:
         if not _is_bad_param(name):
             return {"intent": "product_parts_query", "confidence": 0.92, "params": {"productName": name}, "reason": "本地规则匹配"}
 
-    # product_info_query: "xxx单价/多少钱/信息/是什么/什么颜色/什么原料"
+    # product_info_query (with factory): "泽麟的跳跳鱼多少钱" / "铭泰的黄ABS什么价"
+    m = re.search(r"(.{1,15})的(.{1,30})(单价|多少钱|什么价|信息|详情|规格|是什么|什么颜色|什么原料|重量|多重)", q)
+    if m:
+        factory_candidate = m.group(1).strip()
+        product_candidate = m.group(2).strip()
+        if not _is_bad_param(factory_candidate) and not _is_bad_param(product_candidate):
+            params = {"factoryName": factory_candidate, "productName": product_candidate}
+            color_m = re.search(r"(黄|红|蓝|绿|黑|白|灰|紫|橙|粉|透明)", product_candidate)
+            if color_m:
+                params["color"] = color_m.group(1)
+            return {"intent": "product_info_query", "confidence": 0.92, "params": params, "reason": "本地规则匹配"}
+
+    # product_info_query (simple): "xxx单价/多少钱/信息/是什么/什么颜色/什么原料"
     m = re.search(r"(.+?)(单价|多少钱|什么价|信息|详情|规格|是什么|什么颜色|什么原料|重量|多重)", q)
     if m and len(m.group(1)) < 30:
         name = m.group(1).strip()
